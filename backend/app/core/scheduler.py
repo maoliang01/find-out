@@ -26,6 +26,7 @@ SCHEDULED_TASK_MAX_RUNTIME_SECONDS = int(os.getenv("SCHEDULED_TASK_MAX_RUNTIME_S
 SCHEDULED_MAX_ARTICLES = int(os.getenv("SCHEDULED_MAX_ARTICLES", "10"))
 KNOWLEDGE_JOB_INTERVAL_SECONDS = int(os.getenv("KNOWLEDGE_JOB_INTERVAL_SECONDS", "60"))
 KNOWLEDGE_JOB_BATCH_SIZE = int(os.getenv("KNOWLEDGE_JOB_BATCH_SIZE", "2"))
+INSIGHT_ALERT_INTERVAL_MINUTES = int(os.getenv("INSIGHT_ALERT_INTERVAL_MINUTES", "30"))
 
 
 async def _scrape_scheduled_url(
@@ -477,6 +478,9 @@ def start_scheduler() -> BackgroundScheduler:
     logger.info("启动时立即同步任务状态...")
     _update_next_run_times()
 
+    # 注册知识增强 Worker，定期处理 pending 任务
+    register_knowledge_job_worker(scheduler)
+
     scheduler.start()
     logger.info("定时任务调度器已启动")
 
@@ -578,6 +582,25 @@ def register_knowledge_job_worker(scheduler):
         max_instances=1,
     )
     logger.info("知识增强 Worker 已注册，间隔 %s 秒，每批 %s 个任务", KNOWLEDGE_JOB_INTERVAL_SECONDS, KNOWLEDGE_JOB_BATCH_SIZE)
+
+
+def run_insight_alert_monitor():
+    """Periodically persist new multi-source signals for human review."""
+    from app.services.insight_alerts import scan_insight_alerts
+    result = scan_insight_alerts()
+    logger.info("洞察预警扫描完成: %s", result)
+
+
+def register_insight_alert_monitor(scheduler):
+    scheduler.add_job(
+        run_insight_alert_monitor,
+        "interval",
+        minutes=max(5, INSIGHT_ALERT_INTERVAL_MINUTES),
+        id="insight_alert_monitor",
+        replace_existing=True,
+        max_instances=1,
+    )
+    logger.info("洞察预警扫描器已注册，间隔 %s 分钟", INSIGHT_ALERT_INTERVAL_MINUTES)
 
 
 # 全局调度器实例

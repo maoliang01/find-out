@@ -20,6 +20,7 @@ from app.models.article import Article
 from app.models.knowledge import KnowledgeJob
 from app.models.synthesis import KnowledgeSynthesis
 from app.models.prediction import PredictionRecord
+from app.models.insight_alert import InsightAlert
 from app.services.kg import Neo4jService, EntityExtractor, EmbeddingService
 from app.services.kg.graph import EntityNode, Relationship
 from app.services.kg.embedding import VectorStore
@@ -27,6 +28,7 @@ from app.services.kg.qa import answer_question
 from app.services.kg.mining import find_relation_evidence
 from app.services import kg_sync
 from app.services.knowledge_synthesis import KnowledgeSynthesisService
+from app.core.llm import llm_service
 
 logger = logging.getLogger("ai-studio")
 
@@ -34,6 +36,35 @@ router = APIRouter(prefix="/api/kg", tags=["知识图谱"])
 
 # 批量处理进度存储
 _batch_progress = {}
+
+
+def _enhancement_job_id(article: Article) -> Optional[str]:
+    """Return the enhancement job that corresponds to the article's current body.
+
+    KG entity extraction and knowledge enhancement are separate pipelines.  The
+    article's ``kg_status`` therefore cannot tell us whether knowledge points
+    and cross-document candidates have actually been produced.
+    """
+    content = article.content or ""
+    if not content:
+        return None
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"enh_{article.id}_{content_hash[:16]}"
+
+
+def _enhancement_statuses(db: Session, articles: List[Article]) -> Dict[str, str]:
+    """Load current-version enhancement status for a group of articles in one query."""
+    expected = {
+        job_id: str(article.id)
+        for article in articles
+        if (job_id := _enhancement_job_id(article))
+    }
+    if not expected:
+        return {}
+    rows = db.query(KnowledgeJob.id, KnowledgeJob.status).filter(
+        KnowledgeJob.id.in_(expected)
+    ).all()
+    return {expected[job_id]: job_status for job_id, job_status in rows}
 
 
 # ============ 依赖项 ============
@@ -1781,20 +1812,29 @@ async def get_enhancement_stats(db: Session = Depends(get_db)):
     """
     from app.models.article import Article
 
-    # 从数据库查询已处理文章数
-    processed_count = db.query(Article).filter(
-        Article.kg_status.in_(['success', 'partial'])
-    ).count()
-
-    # 获取最后处理时间
-    last_article = db.query(Article).filter(
-        Article.kg_status.in_(['success', 'partial']),
-        Article.kg_processed_at.isnot(None)
-    ).order_by(Article.kg_processed_at.desc()).first()
-
-    last_processed_at = (
-        last_article.kg_processed_at if last_article else None
+    # ``kg_status`` only records entity extraction.  Insight statistics must
+    # instead be based on the enhancement job for the article's current body.
+    articles = db.query(Article).filter(
+        Article.status.in_(["completed", "success"])
+    ).all()
+    enhancement_status = _enhancement_statuses(db, articles)
+    processed_count = sum(
+        1 for article in articles
+        if enhancement_status.get(str(article.id)) == "completed"
     )
+    pending_count = sum(
+        1 for article in articles
+        if enhancement_status.get(str(article.id)) in {None, "pending", "processing"}
+    )
+    failed_count = sum(
+        1 for article in articles
+        if enhancement_status.get(str(article.id)) in {"failed", "rejected"}
+    )
+    last_completed_job = db.query(KnowledgeJob).filter(
+        KnowledgeJob.job_type == "article_enhancement",
+        KnowledgeJob.status == "completed",
+    ).order_by(KnowledgeJob.completed_at.desc()).first()
+    last_processed_at = last_completed_job.completed_at if last_completed_job else None
 
     # 从Neo4j查询知识点和关联数量
     total_points = 0
@@ -1834,6 +1874,8 @@ async def get_enhancement_stats(db: Session = Depends(get_db)):
 
     return {
         "total_articles_processed": processed_count,
+        "enhancement_pending_articles": pending_count,
+        "enhancement_failed_articles": failed_count,
         "total_knowledge_points": total_points,
         "total_associations": total_associations,
         "average_points_per_article": average_points_per_article,
@@ -2353,10 +2395,12 @@ async def batch_process_articles_enhancement(
             detail="没有找到有效的文章"
         )
 
-    # 过滤掉已处理的文章（除非强制重新处理）
+    # Entity extraction success does not mean enhancement success.  Use the
+    # current-content job state so migrated/failed documents can be processed.
+    enhancement_status = _enhancement_statuses(db, articles)
     articles_to_process = []
     for article in articles:
-        if request.force_reprocess or article.kg_status != "success":
+        if request.force_reprocess or enhancement_status.get(str(article.id)) != "completed":
             articles_to_process.append(article)
 
     if not articles_to_process:
@@ -2542,9 +2586,12 @@ async def auto_detect_pending_articles(db: Session = Depends(get_db)):
     pending_articles = []
     already_processed = []
 
+    enhancement_status = _enhancement_statuses(db, all_articles)
     for article in all_articles:
-        # 判断是否已处理
-        is_processed = article.kg_status in ["success", "partial"]
+        # A document is ready for insight only after its current-version
+        # enhancement job completed, not merely after generic KG extraction.
+        current_enhancement_status = enhancement_status.get(str(article.id), "not_started")
+        is_processed = current_enhancement_status == "completed"
 
         article_data = {
             "id": article.id,
@@ -2552,6 +2599,7 @@ async def auto_detect_pending_articles(db: Session = Depends(get_db)):
             "summary": article.summary[:200] if article.summary else "",
             "word_count": article.word_count,
             "kg_status": article.kg_status,
+            "enhancement_status": current_enhancement_status,
             "category_name": article.category.name if article.category else None,
             "is_processed": is_processed,
         }
@@ -2625,10 +2673,10 @@ async def discover_prediction_events(
     days: int = Query(90, ge=1, le=3650),
     db: Session = Depends(get_db),
 ):
-    """从近期文章主动发现可能值得预测的事件。"""
+    """从近期文章主动发现候选事件；证据不足时如实返回单源信号。"""
     from app.services.kg.event_discovery import EventDiscoveryService
 
-    candidates = EventDiscoveryService().discover(db, limit=limit, days=days)
+    candidates = EventDiscoveryService().discover(db, limit=max(5, limit), days=days)
     return {"events": candidates, "total": len(candidates)}
 
 class TrendPredictionRequest(BaseModel):
@@ -2643,12 +2691,73 @@ class DiscoveredEventPredictionRequest(BaseModel):
     time_range: int = Field(30, ge=1, le=365)
     prediction_type: str = Field("general")
     model_id: Optional[str] = Field(None, min_length=1, max_length=200)
+    article_ids: Optional[List[str]] = Field(None, min_length=2, max_length=50)
 
 
 class PredictionFeedbackRequest(BaseModel):
     actual_trend: Literal["up", "down", "stable"]
     feedback: Optional[str] = None
     accuracy_score: Optional[float] = Field(None, ge=0, le=1)
+
+
+class InsightAlertReviewRequest(BaseModel):
+    status: Literal["acknowledged", "dismissed"]
+    review_note: Optional[str] = Field(None, max_length=2000)
+
+
+def _serialize_insight_alert(alert: InsightAlert) -> Dict[str, Any]:
+    return {
+        "id": alert.id,
+        "event_id": alert.event_id,
+        "topic": alert.topic,
+        "title": alert.title,
+        "severity": alert.severity,
+        "status": alert.status,
+        "confidence": alert.confidence,
+        "evidence_article_ids": alert.evidence_article_ids or [],
+        "signal_reasons": alert.signal_reasons or [],
+        "match_evidence": alert.match_evidence or {},
+        "review_note": alert.review_note,
+        "first_seen_at": alert.first_seen_at.isoformat() if alert.first_seen_at else None,
+        "last_seen_at": alert.last_seen_at.isoformat() if alert.last_seen_at else None,
+        "reviewed_at": alert.reviewed_at.isoformat() if alert.reviewed_at else None,
+    }
+
+
+@router.get("/insight-alerts")
+async def list_insight_alerts(
+    alert_status: Optional[str] = Query("open", alias="status"),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    query = db.query(InsightAlert)
+    if alert_status:
+        query = query.filter(InsightAlert.status == alert_status)
+    alerts = query.order_by(InsightAlert.last_seen_at.desc()).limit(limit).all()
+    return {"alerts": [_serialize_insight_alert(alert) for alert in alerts], "total": len(alerts)}
+
+
+@router.post("/insight-alerts/scan")
+async def scan_insight_alerts_now():
+    from app.services.insight_alerts import scan_insight_alerts
+    return scan_insight_alerts()
+
+
+@router.post("/insight-alerts/{alert_id}/review")
+async def review_insight_alert(
+    alert_id: str,
+    request: InsightAlertReviewRequest,
+    db: Session = Depends(get_db),
+):
+    alert = db.query(InsightAlert).filter(InsightAlert.id == alert_id).first()
+    if alert is None:
+        raise HTTPException(status_code=404, detail="预警不存在")
+    alert.status = request.status
+    alert.review_note = request.review_note
+    alert.reviewed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(alert)
+    return _serialize_insight_alert(alert)
 
 
 def _save_prediction_record(db: Session, request: TrendPredictionRequest, result) -> str:
@@ -2790,17 +2899,30 @@ async def predict_discovered_event(
     from app.services.kg.prediction import TrendPredictionEngine
     from app.core.llm import llm_service
 
-    events = EventDiscoveryService().discover(db, limit=100, days=3650)
+    # Keep the lookup window aligned with the discovery page so the event id
+    # and evidence set reviewed by the user remain reproducible.
+    events = EventDiscoveryService().discover(db, limit=100, days=90)
     event = next((item for item in events if item["id"] == request.event_id), None)
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="候选事件已过期，请刷新候选事件")
-    if len(event.get("evidence_articles") or []) < 2:
+    original_evidence = event.get("evidence_articles") or []
+    original_ids = [str(item.get("id")) for item in original_evidence if item.get("id")]
+    selected_ids = list(dict.fromkeys(request.article_ids or original_ids))
+    unknown_ids = sorted(set(selected_ids).difference(original_ids))
+    if unknown_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="审核材料中包含不属于当前候选事件的文章",
+        )
+    selected_evidence = [item for item in original_evidence if str(item.get("id")) in selected_ids]
+    if len(selected_evidence) < 2:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="该候选事件只有单篇证据，暂不进行交叉预测")
-    evidence_ids = [item.get("id") for item in event.get("evidence_articles") or [] if item.get("id")]
+    reviewed_event = {**event, "evidence_articles": selected_evidence}
+    evidence_ids = [item.get("id") for item in selected_evidence if item.get("id")]
     article_rows = db.query(Article).filter(Article.id.in_(evidence_ids)).all() if evidence_ids else []
     articles_by_id = {str(article.id): article for article in article_rows}
     analysis_event = {
-        **event,
+        **reviewed_event,
         "evidence_articles": [
             {
                 **item,
@@ -2810,7 +2932,7 @@ async def predict_discovered_event(
                     or ""
                 )[:4000] if str(item.get("id")) in articles_by_id else item.get("summary", ""),
             }
-            for item in event.get("evidence_articles") or []
+            for item in selected_evidence
         ],
     }
     neo4j = get_neo4j_service()
@@ -2821,6 +2943,13 @@ async def predict_discovered_event(
             prediction_type=request.prediction_type,
             model_id=request.model_id,
         )
+        result.knowledge_basis.update({
+            "evidence_article_ids": selected_ids,
+            "excluded_article_ids": [item_id for item_id in original_ids if item_id not in selected_ids],
+            "user_reviewed": request.article_ids is not None,
+            "reviewed_at": datetime.utcnow().isoformat(),
+            "time_range": request.time_range,
+        })
         record_request = TrendPredictionRequest(
             topic=result.topic,
             time_range=request.time_range,
@@ -2839,7 +2968,7 @@ async def predict_discovered_event(
             "knowledge_basis": result.knowledge_basis,
             "interpretation": result.interpretation,
             "prediction_id": prediction_id,
-            "event": event,
+            "event": reviewed_event,
         }
     finally:
         await neo4j.close()
