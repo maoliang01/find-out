@@ -529,6 +529,7 @@ export interface ChatRequestAPI {
   temperature?: number;
   max_tokens?: number;
   model_config?: ModelConfigAPI;
+  session_id?: string;
 }
 
 /** 聊天响应 */

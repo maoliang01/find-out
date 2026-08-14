@@ -47,6 +47,8 @@ services:
     container_name: ai-studio-backend
     restart: unless-stopped
     environment:
+      # 锁定为本地 SQLite（文章/会话历史只保存在本机 backend/data/ai_studio.db）
+      DB_TYPE: sqlite
       # 本地 PostgreSQL 连接
       DB_HOST: ${DB_HOST:-localhost}
       DB_PORT: ${DB_PORT:-5432}

@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
             init_scheduler,
             register_kg_reconcile_job,
             register_knowledge_job_worker,
+            register_insight_alert_monitor,
         )
         _scheduler = init_scheduler()
         logger.info("定时任务调度器已启动")
@@ -50,6 +51,7 @@ async def lifespan(app: FastAPI):
         interval = int(os.getenv("KG_RECONCILE_INTERVAL_MINUTES", "10"))
         register_kg_reconcile_job(_scheduler, interval_minutes=interval)
         register_knowledge_job_worker(_scheduler)
+        register_insight_alert_monitor(_scheduler)
 
         # 幂等初始化图谱约束、Claim 索引和现有实体的稳定标识。
         from app.services.kg import Neo4jService

@@ -25,6 +25,8 @@ from app.models.wechat import (
 from app.models.knowledge import KnowledgeJob
 from app.models.synthesis import KnowledgeSynthesis
 from app.models.prediction import PredictionRecord
+from app.models.insight_alert import InsightAlert
+from app.models.chat import ChatSession, ChatMessage
 
 __all__ = [
     "Article",
@@ -42,4 +44,7 @@ __all__ = [
     "KnowledgeJob",
     "KnowledgeSynthesis",
     "PredictionRecord",
+    "InsightAlert",
+    "ChatSession",
+    "ChatMessage",
 ]

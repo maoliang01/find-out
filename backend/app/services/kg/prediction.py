@@ -8,6 +8,7 @@ import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -158,20 +159,65 @@ class TrendPredictionEngine:
             trend = "stable"
 
         evidence_count = len(article_ids)
-        confidence = min(0.9, 0.35 + min(0.3, evidence_count * 0.08) + min(0.2, len(points) * 0.02) + min(0.15, relation_count * 0.03))
+        independent_sources = {
+            (urlparse(str(item.get("url") or "")).netloc or str(item.get("id") or "unknown")).lower().removeprefix("www.")
+            for item in evidence
+        }
+        confidence = min(
+            0.9,
+            0.35
+            + min(0.18, evidence_count * 0.05)
+            + min(0.18, len(independent_sources) * 0.08)
+            + min(0.16, len(points) * 0.02)
+            + min(0.12, relation_count * 0.03),
+        )
+        # These are conditional paths, not calibrated probabilities.  The
+        # corpus has no outcome time series, so inventing probability values or
+        # a numeric growth curve would make the result look more certain than
+        # the evidence allows.
         scenarios = [
-            {"name": "基准情景", "trend": trend, "probability": round(confidence, 2), "basis": "跨文档证据与知识点综合"},
-            {"name": "乐观情景", "trend": "up", "probability": round(min(0.9, confidence * 0.8), 2), "basis": "积极事件信号持续"},
-            {"name": "风险情景", "trend": "down", "probability": round(max(0.1, 1 - confidence), 2), "basis": "负面信号或证据不足"},
+            {
+                "name": "基准情景",
+                "trend": trend,
+                "basis": "现有多来源材料中的推进与约束信号",
+                "condition": "后续公开信息与现有证据方向一致",
+                "invalidated_by": "权威来源出现相反进展、关键主体否认或计划取消",
+            },
+            {
+                "name": "推进情景",
+                "trend": "up",
+                "basis": "关键主体继续发布实施、投资、获批或落地证据",
+                "condition": "至少出现一项新的独立来源可核验进展",
+                "invalidated_by": "执行时间表延期、资金或许可条件未满足",
+            },
+            {
+                "name": "约束情景",
+                "trend": "down",
+                "basis": "材料中出现风险、争议、成本或监管约束",
+                "condition": "约束信号被独立来源重复确认",
+                "invalidated_by": "约束被官方澄清或关键指标显著改善",
+            },
         ]
         basis = {
             "event_id": event.get("id"),
             "evidence_articles": evidence_count,
+            "independent_sources": len(independent_sources),
             "knowledge_points": len(points),
             "cross_document_relations": relation_count,
             "multi_document": evidence_count > 1,
             "evidence_titles": [item.get("title") for item in evidence if item.get("title")],
             "support_level": "较强" if confidence >= 0.7 else ("一般" if confidence >= 0.5 else "较弱"),
+            "assessment_mode": "conditional_scenario",
+            "confidence_note": (
+                f"该分数衡量当前证据覆盖度，不是事件发生概率或数值预测准确率。"
+                f"本次 {evidence_count} 篇材料来自 {len(independent_sources)} 个独立来源；"
+                + ("同一来源的连续材料主要用于时序走向分析，不能视为多来源交叉确认。" if len(independent_sources) == 1 else "不同来源可用于交叉核验，但仍需检查其是否引用同一首发信息。")
+            ),
+            "monitoring_indicators": [
+                "是否出现新的独立来源确认",
+                "关键主体是否发布可核验的实施、审批、投资或调整信息",
+                "是否出现与现有结论相矛盾的权威来源或数据",
+            ],
             "knowledge_point_details": [
                 {
                     "title": point.get("title") or point.get("name", ""),
@@ -198,7 +244,7 @@ class TrendPredictionEngine:
             trend=trend,
             confidence=confidence,
             factors=factors,
-            timeline=self._generate_timeline(trend, time_range),
+            timeline=self._generate_monitoring_timeline(time_range),
             prediction_type=prediction_type,
             generated_at=datetime.now().isoformat(),
             knowledge_basis=basis,
@@ -327,8 +373,9 @@ class TrendPredictionEngine:
         if not basis.get('published_syntheses') and entity_count == 0:
             confidence = min(confidence, 0.35)
 
-        # 生成时间线
-        timeline = self._generate_timeline(trend, time_range)
+        # No observed time series is available for this legacy topic endpoint.
+        # Return review checkpoints instead of synthetic numeric forecasts.
+        timeline = self._generate_monitoring_timeline(time_range)
 
         return PredictionResult(
             topic=topic,
@@ -341,31 +388,22 @@ class TrendPredictionEngine:
             knowledge_basis=basis,
         )
 
-    def _generate_timeline(self, trend: str, days: int) -> List[Dict[str, Any]]:
-        """生成时间线预测"""
-        timeline = []
-        base_value = 100
-
-        trend_factor = {'up': 0.02, 'down': -0.02, 'stable': 0}.get(trend, 0)
-
-        for day in range(days):
-            date = datetime.now() + timedelta(days=day)
-            predicted_value = base_value * (1 + trend_factor * day)
-
-            timeline.append({
-                'date': date.strftime('%Y-%m-%d'),
-                'predicted_value': round(predicted_value, 2),
-                'confidence_interval': {
-                    'lower': round(predicted_value * 0.9, 2),
-                    'upper': round(predicted_value * 1.1, 2)
-                }
-            })
-
-        return timeline
+    def _generate_monitoring_timeline(self, days: int) -> List[Dict[str, Any]]:
+        """Return evidence-review checkpoints rather than fabricated values."""
+        checkpoints = sorted({0, min(7, days), min(14, days), days})
+        return [
+            {
+                "date": (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d"),
+                "checkpoint": f"第 {offset} 天" if offset else "当前基线",
+                "purpose": "核验新增独立来源、关键主体行动与反证信号",
+                "kind": "evidence_review",
+            }
+            for offset in checkpoints
+        ]
 
     def _generate_default_timeline(self, days: int) -> List[Dict[str, Any]]:
-        """生成默认时间线"""
-        return self._generate_timeline('stable', days)
+        """Generate default evidence-review checkpoints."""
+        return self._generate_monitoring_timeline(days)
 
     async def predict_sentiment(self, topic: str) -> PredictionResult:
         """预测舆情趋势"""

@@ -206,7 +206,8 @@ def init_db():
     # 导入所有模型以确保它们被注册
     from app.models import (
         Article, Category, ScrapeSource, Keyword, ArticleKeyword, ArticleLink,
-        ScheduledTask, ScrapeHistory, KnowledgeJob, KnowledgeSynthesis, PredictionRecord
+        ScheduledTask, ScrapeHistory, KnowledgeJob, KnowledgeSynthesis, PredictionRecord, InsightAlert,
+        ChatSession, ChatMessage
     )
 
     engine = get_engine()

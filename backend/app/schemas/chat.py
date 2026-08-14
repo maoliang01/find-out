@@ -1,11 +1,43 @@
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
+from datetime import datetime
 
 
 class Message(BaseModel):
-    """对话消息"""
+    """对话消息（聊天请求/响应共用的消息结构）"""
     role: str  # user, assistant, system
     content: str
+
+
+class StoredMessage(BaseModel):
+    """持久化到本机数据库的对话消息。"""
+    id: str
+    session_id: str
+    role: str
+    content: str
+    model: Optional[str] = None
+    created_at: datetime
+
+
+class ChatSessionCreate(BaseModel):
+    """创建会话请求。"""
+    title: Optional[str] = "新对话"
+    model: Optional[str] = ""
+
+
+class ChatSessionOut(BaseModel):
+    """会话信息（不含消息，消息单列接口获取）。"""
+    id: str
+    title: str
+    model: str
+    use_rag: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatSessionList(BaseModel):
+    """会话列表响应。"""
+    sessions: List[ChatSessionOut]
 
 
 class ChatRequest(BaseModel):

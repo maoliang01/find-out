@@ -9,6 +9,7 @@
 """
 import asyncio
 import logging
+import os
 import threading
 from datetime import datetime
 
@@ -80,17 +81,48 @@ def build_neo4j() -> Neo4jService:
     return Neo4jService()
 
 
+async def on_article_sync_only(article: Article) -> bool:
+    """仅同步 Article metadata 到 Neo4j，不触发后台抽实体。
+
+    用于 WechatPipeline 等非 FastAPI 请求上下文中，直接返回同步结果。
+    """
+    neo4j = build_neo4j()
+    try:
+        ok = await neo4j.upsert_article_metadata(
+            article_id=article.id,
+            title=article.title or "",
+            url=article.url or "",
+            summary=article.summary,
+            content_hash=article.content_hash,
+            kg_status=article.kg_status or "pending"
+        )
+        if not ok:
+            logger.warning(f"新建文章 {article.id} 时 Neo4j metadata 同步失败,后续 reconcile 兜底")
+        return ok
+    finally:
+        await neo4j.close()
+
+
+def trigger_async_extraction(article_id: str) -> None:
+    """在后台线程中安全地触发异步实体抽取。
+
+    用于非异步上下文（如同步函数或 BackgroundTasks 不可用的场景），
+    通过 asyncio.run() 在新事件循环中执行抽取任务。
+    """
+    def _run():
+        try:
+            asyncio.run(extract_and_link_entities(article_id))
+        except Exception as e:
+            logger.error(f"异步抽取任务失败 {article_id}: {e}")
+
+    import threading
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+
 async def on_article_created(article: Article, background_tasks: BackgroundTasks) -> None:
     """文档管理新建文章后调用:同步 metadata + 排后台抽实体"""
-    neo4j = build_neo4j()
-    ok = await neo4j.upsert_article_metadata(
-        article_id=article.id,
-        title=article.title or "",
-        url=article.url or "",
-        summary=article.summary,
-        content_hash=article.content_hash,
-        kg_status=article.kg_status or "pending"
-    )
+    ok = await on_article_sync_only(article)
     if not ok:
         logger.warning(f"新建文章 {article.id} 时 Neo4j metadata 同步失败,后续 reconcile 兜底")
     # 后台抽实体(失败由 kg_status='failed' 标记)
@@ -167,14 +199,16 @@ async def _extract_and_link_entities_inner(article_id: str) -> bool:
 
         extractor = EntityExtractor()
         extraction_error = None
+        # 增加超时到 600 秒，避免因 LLM 响应慢导致 partial 状态
+        EXTRACTION_TIMEOUT = int(os.environ.get("KG_EXTRACTION_TIMEOUT_SECONDS", "600"))
         try:
             result = await asyncio.wait_for(
                 extractor.extract(content, article_id=str(article.id)),
-                timeout=300,
+                timeout=EXTRACTION_TIMEOUT,
             )
         except asyncio.TimeoutError:
             result = None
-            extraction_error = "知识抽取超时（300 秒）"
+            extraction_error = f"知识抽取超时（{EXTRACTION_TIMEOUT} 秒），可能是内容过长或 LLM 响应慢"
             logger.error(f"文章 {article_id} 实体抽取超时")
         if result and result.error:
             extraction_error = result.error

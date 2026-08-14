@@ -15,7 +15,7 @@ from app.core.database import get_db
 from app.models.article import Article, Keyword, ArticleKeyword
 from app.services.wechat.crawler import WechatCrawler, WechatArticle
 from app.services.wechat.cookie_manager import CookieManager
-from app.services.kg_sync import on_article_created
+from app.services.kg_sync import on_article_sync_only, trigger_async_extraction
 from app.services.scraper import get_scraper
 
 logger = logging.getLogger(__name__)
@@ -70,13 +70,12 @@ class WechatPipeline:
             if not db_article:
                 return {"success": False, "error": "文章保存失败"}
 
-            # 4. 触发知识图谱抽取
+            # 4. 同步 Article metadata 到 Neo4j，并后台触发实体抽取
             try:
-                from fastapi import BackgroundTasks
-                background_tasks = BackgroundTasks()
-                await on_article_created(db_article, background_tasks)
+                await on_article_sync_only(db_article)
+                trigger_async_extraction(db_article.id)
             except Exception as e:
-                logger.warning(f"知识图谱抽取触发失败: {e}")
+                logger.warning(f"知识图谱同步触发失败: {e}")
 
             return {
                 "success": True,

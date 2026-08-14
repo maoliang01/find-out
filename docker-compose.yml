@@ -59,7 +59,9 @@ services:
     container_name: ai-studio-backend
     restart: unless-stopped
     environment:
-      # 数据库连接（使用 Docker 网络服务名）
+      # 锁定为本地 SQLite（文章/会话历史只保存在本机 backend/data/ai_studio.db，不使用/不同步到 PG）
+      DB_TYPE: sqlite
+      # 数据库连接（仅 DB_TYPE=postgresql 时使用）
       DB_HOST: db
       DB_PORT: 5432
       DB_NAME: ${DB_NAME:-ai_studio}

@@ -1,7 +1,7 @@
 import { create } from "zustand";
-import { createJSONStorage, persist, subscribeWithSelector } from "zustand/middleware";
+import { subscribeWithSelector } from "zustand/middleware";
 import type { ChatSession, Message, ModelConfigAPI } from "@/types";
-import { sendChat, streamChat } from "@/lib/api";
+import { sendChat, streamChat, getSessions, createSession, deleteSession, getSessionMessages } from "@/lib/api";
 import { useSettingsStore } from "./settings-store";
 
 // 模型配置类型（内部使用，camelCase）
@@ -54,11 +54,12 @@ interface ChatStore {
   // 异步操作
   sendMessage: (sessionId: string, content: string) => Promise<void>;
   loadModels: () => Promise<void>;
+  loadSessions: () => Promise<void>;
+  loadMessages: (sessionId: string) => Promise<void>;
 }
 
 export const useChatStore = create<ChatStore>()(
-  persist(
-    subscribeWithSelector((set, get) => ({
+  subscribeWithSelector((set, get) => ({
     sessions: [],
     currentSessionId: null,
     models: [],
@@ -72,34 +73,59 @@ export const useChatStore = create<ChatStore>()(
 
     setCurrentSession: (id) => set({ currentSessionId: id }),
 
-    addSession: () => {
+    addSession: async () => {
       const state = get();
-      const newSession: ChatSession = {
-        id: Date.now().toString(),
-        title: "新对话",
-        model: state.selectedModel || "",
-        messages: [],
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        useRag: false,
-      };
+      let newSession: ChatSession;
+      try {
+        const created = await createSession({
+          model: state.selectedModel || "",
+        });
+        newSession = {
+          id: created.id,
+          title: created.title,
+          model: created.model,
+          messages: [],
+          createdAt: new Date(created.created_at),
+          updatedAt: new Date(created.updated_at),
+          useRag: created.use_rag,
+        };
+      } catch (e) {
+        console.error("创建会话失败，回退到本地临时会话:", e);
+        // 后端不可用时回退到本地临时会话，避免页面无法使用
+        newSession = {
+          id: `local-${Date.now().toString()}`,
+          title: "新对话",
+          model: state.selectedModel || "",
+          messages: [],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          useRag: false,
+        };
+      }
       set((state) => ({
         sessions: [newSession, ...state.sessions],
         currentSessionId: newSession.id,
       }));
     },
 
-    deleteSession: (id) =>
-      set((state) => {
-        const newSessions = state.sessions.filter((s) => s.id !== id);
-        return {
-          sessions: newSessions,
-          currentSessionId:
-            state.currentSessionId === id
-              ? newSessions[0]?.id || null
-              : state.currentSessionId,
-        };
-      }),
+    deleteSession: async (id) => {
+      // 本地先移除，后端删除失败仅告警，不阻塞交互
+      const newSessions = get().sessions.filter((s) => s.id !== id);
+      set((state) => ({
+        sessions: newSessions,
+        currentSessionId:
+          state.currentSessionId === id
+            ? newSessions[0]?.id || null
+            : state.currentSessionId,
+      }));
+      if (!id.startsWith("local-")) {
+        try {
+          await deleteSession(id);
+        } catch (e) {
+          console.error("删除后端会话失败:", e);
+        }
+      }
+    },
 
     addMessage: (sessionId, message) =>
       set((state) => ({
@@ -265,6 +291,8 @@ export const useChatStore = create<ChatStore>()(
             messages,
             stream: false,
             model_config: modelConfig,
+            // 服务端据此将消息写入本机数据库（KG 增强分支不携带，故不落库）
+            session_id: sessionId.startsWith("local-") ? undefined : sessionId,
           };
 
           const response = await sendChat(requestData, abortController.signal);
@@ -284,6 +312,7 @@ export const useChatStore = create<ChatStore>()(
               messages,
               stream: true,
               model_config: modelConfig,
+              session_id: sessionId.startsWith("local-") ? undefined : sessionId,
             }, abortController.signal)) {
               if (abortController.signal.aborted) {
                 console.log("流式请求已被用户取消");
@@ -372,20 +401,70 @@ export const useChatStore = create<ChatStore>()(
         isInitialized: true,
       });
     },
-  })),
-    {
-      name: "chat-store",
-      storage: createJSONStorage(() => localStorage),
-      // 只持久化用户可见的状态,排除瞬态字段(isStreaming/isLoading/error/abortController/models 等)
-      partialize: (state) =>
-        ({
-          sessions: state.sessions,
-          currentSessionId: state.currentSessionId,
-          selectedModel: state.selectedModel,
-          kgEnhanced: state.kgEnhanced,
-        }) as Partial<ChatStore>,
-    }
-  )
+
+    /**
+     * 从后端本机数据库加载会话列表（不含消息，消息按需懒加载）。
+     */
+    loadSessions: async () => {
+      try {
+        const remote = await getSessions();
+        const sessions: ChatSession[] = remote.map((s) => ({
+          id: s.id,
+          title: s.title,
+          model: s.model,
+          messages: [],
+          createdAt: new Date(s.created_at),
+          updatedAt: new Date(s.updated_at),
+          useRag: s.use_rag,
+        }));
+        // 清空本地会话，以服务端为权威；若当前有会话尚未落库则保留
+        const current = get().currentSessionId;
+        const nextCurrent =
+          current && sessions.some((s) => s.id === current)
+            ? current
+            : sessions[0]?.id ?? null;
+        set({
+          sessions,
+          currentSessionId: nextCurrent,
+        });
+        // 无任何会话时自动创建首个会话，保证打开页面即可开聊
+        if (get().sessions.length === 0) {
+          await get().addSession();
+        }
+      } catch (e) {
+        console.error("加载会话列表失败:", e);
+      }
+    },
+
+    /**
+     * 懒加载某会话的历史消息（从后端本机数据库读取）。
+     */
+    loadMessages: async (sessionId) => {
+      if (sessionId.startsWith("local-")) return;
+      try {
+        const remote = await getSessionMessages(sessionId);
+        const messages: Message[] = remote
+          .filter((m) => m.role === "user" || m.role === "assistant" || m.role === "system")
+          .map((m) => ({
+            id: m.id,
+            role: m.role as Message["role"],
+            content: m.content,
+            createdAt: new Date(m.created_at),
+            model: m.model || undefined,
+          }));
+        // 若该会话消息已加载过（含本地新增），避免覆盖正在编辑的本地消息
+        set((state) => ({
+          sessions: state.sessions.map((s) =>
+            s.id === sessionId && s.messages.length === 0
+              ? { ...s, messages }
+              : s
+          ),
+        }));
+      } catch (e) {
+        console.error(`加载会话 ${sessionId} 消息失败:`, e);
+      }
+    },
+  }))
 );
 
 // 监听 settingsStore.models 的变化，自动更新 chatStore

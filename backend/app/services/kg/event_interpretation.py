@@ -61,14 +61,15 @@ class EventInterpretationService:
 分析规则：
 1. 只能把来源中明确出现的事实写成事实；由事实推到未来影响时，必须明确写出推演链条和不确定性。
 2. “出现后续报道”“官方进一步进展”“持续受到关注”“进入执行阶段”不能单独作为结论。
-3. 至少分析经济、政策/监管两个维度，并根据材料补充产业、技术、市场或社会维度。
-4. 后续变化必须具体到：谁会采取什么动作、影响谁、通过什么机制发生、预计时间范围、什么信号可验证或推翻。
-5. 机会必须说明潜在受益者和进入条件；挑战必须说明风险暴露对象和预警信号。不要写“存在机遇与挑战”之类空话。
+3. 这是综合事件推演，不是单纯的正负面或舆情判断。根据材料选择真正相关的经济、政策/监管、产业、技术、市场、竞争、供应链、资本、社会等维度；证据不足的维度不要强行补写。
+4. 后续变化必须具体到：谁会采取什么动作、影响谁、通过什么机制发生、预计时间范围、触发条件、失效条件，以及什么信号可验证或推翻。
+5. 机会必须说明潜在受益者、进入条件和消失条件；挑战与风险必须说明风险暴露对象、可能性、影响程度、触发条件、预警信号和准备动作。不要写“存在机遇与挑战”之类空话。
 6. 不要把内部方向代码 up/down/stable 解释为股价、概率或确定结果。它仅是材料中推进词与约束词的粗略计数，可质疑或修正。
 7. 若材料不足以支持某个维度，明确写“证据不足”，不得编造政策名称、金额、企业行动或统计数据。
 8. 不要为了增加数量补写空泛条目；宁可输出 2-3 条完整推演，也不要输出没有主体、机制或验证信号的条目。
-9. 控制篇幅：impact_assessments 输出 3-4 条，next_developments 输出 2-3 条，opportunities 和 challenges 各输出 2 条；每个字符串字段不超过 180 个汉字。
-10. 所有字符串中的双引号必须转义，数组和对象之间必须使用英文逗号。输出前自行检查 JSON 可被解析。
+9. 舆情只是综合报告的一个维度。若材料主要来自新闻和政府网站，只能分析媒体信息环境，并在 data_scope 中说明局限，不能假装代表完整公众情绪。
+10. 控制篇幅：impact_assessments 输出 3-5 条，next_developments 输出 2-4 条，opportunities 和 challenges 各输出 1-3 条；每个字符串字段不超过 180 个汉字。
+11. 所有字符串中的双引号必须转义，数组和对象之间必须使用英文逗号。输出前自行检查 JSON 可被解析。
 
 输出严格 JSON，不要输出 Markdown：
 {{
@@ -83,7 +84,8 @@ class EventInterpretationService:
   }},
   "impact_assessments": [
     {{
-      "dimension": "经济/政策/产业/技术/市场/社会",
+      "dimension": "经济/政策/产业/技术/市场/竞争/供应链/资本/社会",
+      "direction": "加速/放缓/扩张/收缩/分化/调整/方向未明",
       "conclusion": "该维度可能发生的具体变化",
       "mechanism": "事实A -> 主体行为变化B -> 结果C",
       "affected_parties": ["具体受影响主体类型"],
@@ -94,22 +96,35 @@ class EventInterpretationService:
   ],
   "next_developments": [
     {{
-      "dimension": "经济/政策/产业/技术/市场/社会",
+      "path": "基准/加速/延迟/分化/反转",
+      "dimension": "经济/政策/产业/技术/市场/竞争/供应链/资本/社会",
       "title": "可验证的具体变化",
       "likelihood": "高/中/低",
       "timeframe": "预计时间范围",
       "mechanism": "为什么会发生的因果链",
+      "trigger_condition": "该变化发生所需的具体条件",
+      "invalidated_by": "会使该推演失效的具体情况",
       "affected_parties": ["受影响主体"],
       "basis": "对应的来源事实",
       "watch_for": "能够验证或推翻该推断的具体指标"
     }}
   ],
   "opportunities": [
-    {{"title": "具体机会", "beneficiaries": ["潜在受益者"], "rationale": "价值如何产生", "entry_condition": "机会成立的前提", "horizon": "时间范围"}}
+    {{"title": "具体机会", "opportunity_type": "市场/技术/政策/产业链/资本/经营", "beneficiaries": ["潜在受益者"], "rationale": "价值如何产生", "entry_condition": "机会成立的前提", "invalidated_by": "机会消失的条件", "watch_for": "机会形成的可核验信号", "horizon": "时间范围"}}
   ],
   "challenges": [
-    {{"title": "具体挑战", "exposed_parties": ["风险暴露对象"], "rationale": "风险如何传导", "warning_signal": "预警指标", "horizon": "时间范围"}}
+    {{"title": "具体挑战或风险", "risk_type": "政策/舆情/技术/市场/供应链/合规/执行", "likelihood": "高/中/低", "impact": "高/中/低", "risk_level": "高/中/低", "exposed_parties": ["风险暴露对象"], "rationale": "风险如何传导", "trigger_condition": "风险触发条件", "warning_signal": "预警指标", "response": "可提前采取的准备动作", "horizon": "时间范围"}}
   ],
+  "public_opinion": {{
+    "current_direction": "当前媒体信息环境中的主要叙事",
+    "sentiment": "正面/中性/负面/分化/证据不足",
+    "trend": "升温/降温/稳定/分化/证据不足",
+    "key_views": ["有来源依据的主要观点"],
+    "controversies": ["主要争议点"],
+    "turning_triggers": ["可能使叙事转向的事件或信号"],
+    "watch_keywords": ["建议监测的关键词"],
+    "data_scope": "说明当前来源覆盖及不能代表完整公众情绪的局限"
+  }},
   "drivers": ["关键推动因素及其作用"],
   "risks": ["可能使推演失效的反向因素"],
   "watch_indicators": ["可量化或可核验的跟踪指标"],
@@ -191,6 +206,16 @@ class EventInterpretationService:
             "next_developments": [],
             "opportunities": [],
             "challenges": [],
+            "public_opinion": {
+                "current_direction": "当前证据不足，未形成可靠的媒体舆情判断。",
+                "sentiment": "证据不足",
+                "trend": "证据不足",
+                "key_views": [],
+                "controversies": [],
+                "turning_triggers": [],
+                "watch_keywords": [],
+                "data_scope": "未完成深度分析。",
+            },
             "drivers": [],
             "risks": [],
             "watch_indicators": [],
@@ -250,6 +275,19 @@ class EventInterpretationService:
 
         for key in ("impact_assessments", "next_developments", "opportunities", "challenges", "drivers", "risks", "watch_indicators"):
             data[key] = cls._as_list(data.get(key))
+        public_opinion = data.get("public_opinion")
+        if not isinstance(public_opinion, dict):
+            public_opinion = {}
+        data["public_opinion"] = {
+            "current_direction": str(public_opinion.get("current_direction") or "当前材料未形成可靠的媒体舆情判断。"),
+            "sentiment": str(public_opinion.get("sentiment") or "证据不足"),
+            "trend": str(public_opinion.get("trend") or "证据不足"),
+            "key_views": cls._as_list(public_opinion.get("key_views")),
+            "controversies": cls._as_list(public_opinion.get("controversies")),
+            "turning_triggers": cls._as_list(public_opinion.get("turning_triggers")),
+            "watch_keywords": cls._as_list(public_opinion.get("watch_keywords")),
+            "data_scope": str(public_opinion.get("data_scope") or "当前结论仅反映已抓取来源的信息环境。"),
+        }
         if len(str(data.get("executive_judgment", "")).strip()) < 15:
             return None, "核心研判过短"
 
@@ -270,6 +308,9 @@ class EventInterpretationService:
             if not item.get("timeframe") or not item["affected_parties"] or not item.get("watch_for"):
                 quality_warnings.append(f"未来变化第 {index} 条缺少时间、影响对象或验证指标")
                 continue
+            item.setdefault("path", "基准")
+            item.setdefault("trigger_condition", "")
+            item.setdefault("invalidated_by", "")
             watch_for = str(item.get("watch_for", ""))
             has_named_indicator = any(marker in watch_for for marker in cls.INDICATOR_MARKERS)
             is_vague_indicator = any(phrase in watch_for for phrase in cls.VAGUE_PHRASES)
@@ -300,13 +341,10 @@ class EventInterpretationService:
                 quality_warnings.append(f"影响分析第 {index} 条结论仍然模糊")
                 continue
             valid_impacts.append(item)
-        dimensions = {str(item.get("dimension", "")) for item in valid_impacts}
         if len(valid_impacts) < 2:
             return None, "影响分析合格内容少于 2 个维度"
-        if not any("经济" in item or "市场" in item for item in dimensions):
-            return None, "合格内容中缺少经济或市场影响"
-        if not any("政策" in item or "监管" in item for item in dimensions):
-            return None, "合格内容中缺少政策或监管影响"
+        for item in valid_impacts:
+            item.setdefault("direction", "方向未明")
         data["impact_assessments"] = valid_impacts
 
         valid_opportunities: List[Dict[str, Any]] = []
@@ -319,6 +357,9 @@ class EventInterpretationService:
             if len(combined) < 24 or all(phrase in combined for phrase in ("产生影响", "行为变化")):
                 quality_warnings.append(f"机会第 {index} 条不够具体")
                 continue
+            item.setdefault("opportunity_type", "综合")
+            item.setdefault("invalidated_by", "")
+            item.setdefault("watch_for", "")
             valid_opportunities.append(item)
         if not valid_opportunities:
             return None, "没有合格的具体机会"
@@ -336,6 +377,12 @@ class EventInterpretationService:
             if len(warning_signal) < 8 or (is_vague_indicator and not has_named_indicator):
                 quality_warnings.append(f"挑战第 {index} 条预警指标不够具体")
                 continue
+            item.setdefault("risk_type", "综合")
+            item.setdefault("likelihood", "中")
+            item.setdefault("impact", "中")
+            item.setdefault("risk_level", "中")
+            item.setdefault("trigger_condition", warning_signal)
+            item.setdefault("response", "")
             valid_challenges.append(item)
         if not valid_challenges:
             return None, "没有合格的具体挑战"

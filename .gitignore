@@ -58,6 +58,8 @@ htmlcov/
 # Claude Code
 .claude/sessions/
 .claude/plans/used/
+.claude/settings.local.json
+.claude/settings.json
 .superpowers/
 .worktrees/
 # 忽略 data 目录下的所有数据库、缓存和运行时配置

@@ -750,6 +750,28 @@ async def save_batch_to_database(request: SaveBatchRequest):
             if saved:
                 saved_count += 1
                 db_ids.append(str(info))
+
+                # 触发知识图谱同步：同步 metadata + 后台抽实体
+                try:
+                    from app.core.database import get_session_local
+                    from app.models.article import Article
+                    from app.services.kg_sync import on_article_sync_only, trigger_async_extraction
+
+                    SessionLocal = get_session_local()
+                    db = SessionLocal()
+                    try:
+                        article = db.query(Article).filter(Article.id == info).first()
+                        if article:
+                            await on_article_sync_only(article)
+                            trigger_async_extraction(article.id)
+                    finally:
+                        db.close()
+                except Exception as kg_error:
+                    # KG 同步失败不影响保存成功响应，仅记录日志
+                    import logging
+                    logging.getLogger("ai-studio").warning(
+                        f"文章 {info} KG 同步触发失败: {kg_error}"
+                    )
             else:
                 failed_count += 1
                 messages.append(f"保存失败: {info}")

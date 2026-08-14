@@ -105,6 +105,80 @@ export async function fetchAvailableModels(): Promise<{ id: string; name: string
   return response.json();
 }
 
+/**
+ * 获取本机数据库保存的对话会话列表（不含消息）。
+ */
+export async function getSessions(): Promise<Array<{
+  id: string;
+  title: string;
+  model: string;
+  use_rag: boolean;
+  created_at: string;
+  updated_at: string;
+}>> {
+  const response = await fetch(`${API_BASE}/chat/sessions`);
+  if (!response.ok) {
+    throw new Error(`获取会话列表失败: ${response.status}`);
+  }
+  const data = await response.json();
+  return data.sessions || [];
+}
+
+/**
+ * 创建对话会话。
+ */
+export async function createSession(data: {
+  title?: string;
+  model?: string;
+}): Promise<{
+  id: string;
+  title: string;
+  model: string;
+  use_rag: boolean;
+  created_at: string;
+  updated_at: string;
+}> {
+  const response = await fetch(`${API_BASE}/chat/sessions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!response.ok) {
+    throw new Error(`创建会话失败: ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * 获取某会话的历史消息。
+ */
+export async function getSessionMessages(sessionId: string): Promise<Array<{
+  id: string;
+  session_id: string;
+  role: string;
+  content: string;
+  model: string | null;
+  created_at: string;
+}>> {
+  const response = await fetch(`${API_BASE}/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
+  if (!response.ok) {
+    throw new Error(`获取会话消息失败: ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * 删除会话及其消息。
+ */
+export async function deleteSession(sessionId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/chat/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`删除会话失败: ${response.status}`);
+  }
+}
+
 // ================================================
 // 模型管理 API
 // ================================================
