@@ -515,10 +515,17 @@ export interface ModelConfigAPI {
   model_name?: string;
 }
 
-/** 聊天消息（API格式） */
+/** 多模态内容部分 */
+export interface MultimodalContentPart {
+  type: "text" | "image_url";
+  text?: string;
+  image_url?: { url: string };
+}
+
+/** 聊天消息（API格式，支持多模态） */
 export interface ChatMessageAPI {
   role: string;
-  content: string;
+  content: string | MultimodalContentPart[];
 }
 
 /** 聊天请求 */
@@ -530,6 +537,7 @@ export interface ChatRequestAPI {
   max_tokens?: number;
   model_config?: ModelConfigAPI;
   session_id?: string;
+  is_multimodal?: boolean;
 }
 
 /** 聊天响应 */

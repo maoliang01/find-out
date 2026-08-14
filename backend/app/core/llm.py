@@ -2,7 +2,7 @@ import time
 import asyncio
 import json
 import logging
-from typing import AsyncIterator, Optional, Dict, Any, List
+from typing import AsyncIterator, Optional, Dict, Any, List, Union
 from openai import AsyncOpenAI
 import httpx
 
@@ -131,7 +131,7 @@ class LLMService:
     async def chat(
         self,
         model_id: str,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, str] | Dict[str, Any]],
         stream: bool = True,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
@@ -163,10 +163,13 @@ class LLMService:
                 config.get("api_key", "")
             )
 
+            # 处理消息格式，支持多模态内容
+            processed_messages = self._process_multimodal_messages(messages)
+
             if stream:
                 response = await client.chat.completions.create(
                     model=config.get("model_name", "gpt-4o"),
-                    messages=messages,
+                    messages=processed_messages,
                     stream=True,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -186,7 +189,7 @@ class LLMService:
             else:
                 response = await client.chat.completions.create(
                     model=config.get("model_name", "gpt-4o"),
-                    messages=messages,
+                    messages=processed_messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
@@ -205,10 +208,33 @@ class LLMService:
         except Exception as e:
             yield f"[错误] {str(e)}"
 
+    def _process_multimodal_messages(self, messages: List[Dict[str, Any] | Dict[str, str]]) -> List[Dict[str, Any]]:
+        """
+        处理消息格式，将前端传来的多模态格式转换为 OpenAI API 格式。
+        前端可能传入:
+        - 普通文本消息: { role: "user", content: "文本" }
+        - 多模态消息: { role: "user", content: [{ type: "text", text: "..." }, { type: "image_url", image_url: { url: "data:..." } }] }
+        """
+        processed = []
+        for msg in messages:
+            # 已经是标准格式（简单文本）
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                processed.append(msg)
+
+            # 多模态内容数组格式
+            elif isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                processed.append(msg)
+
+            # 其他情况（应该不会有）
+            else:
+                processed.append(msg)
+
+        return processed
+
     async def non_stream_chat(
         self,
         model_id: str,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, str] | Dict[str, Any]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         model_config: Optional[Dict[str, Any]] = None,
@@ -239,9 +265,13 @@ class LLMService:
 
         try:
             client = self.get_client(base_url, api_key)
+
+            # 处理消息格式，支持多模态内容
+            processed_messages = self._process_multimodal_messages(messages)
+
             request_kwargs = {
                 "model": config.get("model_name", "gpt-4o"),
-                "messages": messages,
+                "messages": processed_messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
             }

@@ -32,6 +32,7 @@ def _write_message(db: Session, session_id: str, role: str, content: str, model:
         s.updated_at = datetime.utcnow()
         # 新会话以首条提问作为标题，方便在历史列表中识别。
         if role == "user" and s.title == "新对话":
+            # content 已经是提取后的字符串，直接使用
             normalized = " ".join((content or "").split())
             if normalized:
                 s.title = normalized[:30] + ("..." if len(normalized) > 30 else "")
@@ -138,6 +139,20 @@ async def chat(request: Request, db: Session = Depends(get_db)):
     print(f"  session_id: {session_id}")
     print(f"  model_config: {model_config}")
 
+    # 提取用户文本消息用于落库（多模态消息取文本部分）
+    user_text = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                user_text = content
+            elif isinstance(content, list):
+                # 多模态消息，取所有文本部分
+                texts = [part.get("text", "") for part in content if part.get("type") == "text"]
+                user_text = " ".join(texts)
+            # 找到用户消息就停止
+            break
+
     content = await llm_service.non_stream_chat(
         model_id=model_id,
         messages=messages,
@@ -148,8 +163,8 @@ async def chat(request: Request, db: Session = Depends(get_db)):
 
     # 有 session_id 时落库：user 消息在发问时写入，assistant 在回复后写入
     if session_id:
-        if messages and messages[-1].get("role") == "user":
-            _write_message(db, session_id, "user", messages[-1].get("content", ""), model_id)
+        if user_text:
+            _write_message(db, session_id, "user", user_text, model_id)
         _write_message(db, session_id, "assistant", content, model_id)
 
     return ChatResponse(content=content)
@@ -164,9 +179,21 @@ async def chat_stream_generator(request: Request, body: dict, db: Session):
     model_config = body.get("model_config")
     session_id = body.get("session_id")
 
+    # 提取用户文本消息用于落库（多模态消息取文本部分）
+    user_text = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                user_text = content
+            elif isinstance(content, list):
+                texts = [part.get("text", "") for part in content if part.get("type") == "text"]
+                user_text = " ".join(texts)
+            break
+
     # 发问时即写入 user 消息（即使中断也保留问题）
-    if session_id and messages and messages[-1].get("role") == "user":
-        _write_message(db, session_id, "user", messages[-1].get("content", ""), model_id)
+    if session_id and user_text:
+        _write_message(db, session_id, "user", user_text, model_id)
 
     full_content = ""
     try:

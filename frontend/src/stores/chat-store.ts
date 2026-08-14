@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
-import type { ChatSession, Message, ModelConfigAPI } from "@/types";
+import type { ChatSession, Message, ModelConfigAPI, ChatMessageAPI } from "@/types";
 import { sendChat, streamChat, getSessions, createSession, deleteSession, getSessionMessages } from "@/lib/api";
 import { useSettingsStore } from "./settings-store";
 
@@ -53,6 +53,11 @@ interface ChatStore {
 
   // 异步操作
   sendMessage: (sessionId: string, content: string) => Promise<void>;
+  sendMessageWithImage: (
+    sessionId: string,
+    content: string,
+    attachment: { name: string; type: string; base64: string }
+  ) => Promise<void>;
   loadModels: () => Promise<void>;
   loadSessions: () => Promise<void>;
   loadMessages: (sessionId: string) => Promise<void>;
@@ -330,6 +335,109 @@ export const useChatStore = create<ChatStore>()(
             throw chatErr;
           }
         }
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : "发送消息失败";
+        set({ error: errorMessage });
+        get().updateLastMessage(sessionId, `[错误] ${errorMessage}`);
+      } finally {
+        set({ isStreaming: false, abortController: null });
+      }
+    },
+
+    /**
+     * 发送带图片的消息
+     */
+    sendMessageWithImage: async (sessionId, content, attachment) => {
+      const state = get();
+      const session = state.sessions.find((s) => s.id === sessionId);
+      if (!session) return;
+
+      // 确保模型已加载
+      const settingsStore = useSettingsStore.getState();
+      if (!settingsStore.models.length) {
+        await settingsStore.syncModelsFromBackend();
+      }
+
+      // 创建 AbortController
+      const abortController = new AbortController();
+      set({ abortController, error: null });
+
+      // 获取模型配置
+      const settingsModels = useSettingsStore.getState().models;
+      const selectedModelConfig = settingsModels.find((m) => m.id === state.selectedModel);
+
+      if (!selectedModelConfig) {
+        set({ error: "未找到模型配置" });
+        return;
+      }
+
+      const modelConfig = {
+        name: selectedModelConfig.name,
+        type: selectedModelConfig.type,
+        base_url: selectedModelConfig.baseUrl,
+        api_key: selectedModelConfig.apiKey || "",
+        model_name: selectedModelConfig.modelName || "",
+      };
+
+      // 添加用户消息
+      const userMessage: Message = {
+        id: Date.now().toString(),
+        role: "user",
+        content,
+        createdAt: new Date(),
+        attachments: [{
+          id: crypto.randomUUID(),
+          name: attachment.name,
+          type: attachment.type,
+          size: 0,
+          url: attachment.base64,
+        }],
+      };
+      get().addMessage(sessionId, userMessage);
+
+      set({ isStreaming: true });
+
+      try {
+        // 构建消息历史（仅文本，不含之前附件）
+        const messages = session.messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+
+        // 构建带图片的用户消息
+        const imageMessage = {
+          role: "user",
+          content: [
+            { type: "text", text: content || "[用户发送了一张图片]" },
+            {
+              type: "image_url",
+              image_url: { url: attachment.base64 },
+            },
+          ],
+        };
+
+        // 构建助手消息占位
+        const assistantMessageId = (Date.now() + 1).toString();
+        get().addMessage(sessionId, {
+          id: assistantMessageId,
+          role: "assistant",
+          content: "",
+          createdAt: new Date(),
+          model: state.selectedModel,
+        });
+
+        // 调用 API（使用自定义格式）
+        const requestData = {
+          model_id: state.selectedModel,
+          messages: [...messages, imageMessage] as ChatMessageAPI[],
+          stream: false,
+          model_config: modelConfig,
+          session_id: sessionId.startsWith("local-") ? undefined : sessionId,
+          is_multimodal: true,
+        } as import("@/types").ChatRequestAPI;
+
+        const response = await sendChat(requestData, abortController.signal);
+        get().updateLastMessage(sessionId, response.content || "");
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "发送消息失败";
         set({ error: errorMessage });

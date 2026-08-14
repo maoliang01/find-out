@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { useChatStore } from "@/stores/chat-store";
+import { useSettingsStore } from "@/stores/settings-store";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Card } from "@/components/ui/card";
@@ -32,6 +33,10 @@ import {
   Sparkles,
   Eraser,
   ChevronDown,
+  Paperclip,
+  Image,
+  X,
+  FileText,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -55,6 +60,7 @@ export default function ChatPage() {
     setModel,
     isStreaming,
     sendMessage,
+    sendMessageWithImage,
     loadModels,
     loadSessions,
     loadMessages,
@@ -68,6 +74,17 @@ export default function ChatPage() {
   const [popoverEntity, setPopoverEntity] = useState<string | null>(null);
   // 控制是否显示欢迎页面（刷新后默认显示欢迎页，不自动进入历史对话）
   const [showWelcome, setShowWelcome] = useState(true);
+
+  // 文件上传相关状态
+  const [attachedFile, setAttachedFile] = useState<{
+    name: string;
+    type: string;
+    size: number;
+    preview: string;
+    base64: string;
+  } | null>(null);
+  const [showModelWarning, setShowModelWarning] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 初始化时加载模型列表（不加载会话，刷新后显示欢迎页）
   useEffect(() => {
@@ -119,9 +136,80 @@ export default function ChatPage() {
     }
   }, [input]);
 
+  // 检测文件类型是否为图片
+  const isImageFile = (file: File): boolean => {
+    return file.type.startsWith("image/");
+  };
+
+  // 获取多模态模型列表
+  const getMultimodalModels = () => {
+    const settingsStore = useSettingsStore.getState();
+    const allModels = settingsStore.models;
+    return allModels.filter((m: { type: string }) => m.type === "multimodal");
+  };
+
+  // 处理文件上传
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 检测是否是图片
+    const isImage = isImageFile(file);
+    const multimodalModels = getMultimodalModels();
+    const hasMultimodalModel = multimodalModels.length > 0;
+
+    // 如果是图片但没有多模态模型，显示警告
+    if (isImage && !hasMultimodalModel) {
+      setShowModelWarning("您上传了图片文件，但当前没有配置多模态模型（如 qwen3.5），无法识别图片内容。请前往设置页面添加多模态模型。");
+      // 清空文件选择
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+
+    // 如果是图片，自动切换到第一个多模态模型
+    if (isImage && hasMultimodalModel) {
+      const multimodalModel = multimodalModels[0];
+      // 检查当前是否已经是多模态模型
+      if (selectedModel !== multimodalModel.id) {
+        setModel(multimodalModel.id);
+        setShowModelWarning(`已自动切换至多模态模型「${multimodalModel.name}」以支持图片识别`);
+      }
+    }
+
+    // 读取文件并转为 base64
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = event.target?.result as string;
+      setAttachedFile({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        preview: base64,
+        base64: base64,
+      });
+    };
+    reader.readAsDataURL(file);
+
+    // 清空 input 值，以便同一个文件可以被重新选择
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  // 移除已上传的文件
+  const removeAttachedFile = () => {
+    setAttachedFile(null);
+    setShowModelWarning(null);
+  };
+
+  // 格式化文件大小
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  };
+
   // 处理发送消息
   const handleSend = async () => {
-    if (!input.trim() || isStreaming) return;
+    if ((!input.trim() && !attachedFile) || isStreaming) return;
 
     // 确保有会话存在
     let sessionId = currentSessionId;
@@ -135,13 +223,25 @@ export default function ChatPage() {
     const messageContent = input.trim();
     setInput("");
 
+    // 收集附件信息
+    const attachment = attachedFile ? {
+      name: attachedFile.name,
+      type: attachedFile.type,
+      base64: attachedFile.base64,
+    } : null;
+
+    // 清空附件
+    const clearedFile = attachedFile;
+    setAttachedFile(null);
+    setShowModelWarning(null);
+
     if (kgEnhanced) {
-      // 走 KG QA 增强分支
+      // 走 KG QA 增强分支（暂不支持图片）
       const now = new Date();
       const userMsg: Message = {
         id: crypto.randomUUID(),
         role: "user",
-        content: messageContent,
+        content: messageContent || "[上传了图片]",
         createdAt: now,
       };
       const tmpMsg: Message = {
@@ -153,6 +253,7 @@ export default function ChatPage() {
       addMessage(sessionId, userMsg);
       addMessage(sessionId, tmpMsg);
       try {
+        // KG 增强暂不支持图片，仅传文本
         const data = await qaAnswer(messageContent, selectedModel);
         useChatStore.setState((state) => ({
           sessions: state.sessions.map((s) => {
@@ -179,7 +280,14 @@ export default function ChatPage() {
 
     // 发送消息后退出欢迎页模式
     setShowWelcome(false);
-    await sendMessage(sessionId, messageContent);
+
+    // 如果有附件且是图片，直接调用带图片的消息
+    if (attachment && attachment.type.startsWith("image/")) {
+      // 使用 chat store 的 sendMessageWithImage 方法
+      await sendMessageWithImage(sessionId, messageContent, attachment);
+    } else {
+      await sendMessage(sessionId, messageContent);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -199,8 +307,55 @@ export default function ChatPage() {
   // 输入区（空态居中 / 有消息时贴底，同一套 UI）
   const composer = (
     <div className="mx-auto w-full max-w-3xl px-5">
+      {/* 警告提示 */}
+      {showModelWarning && (
+        <div className="mb-2 p-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700 flex items-center gap-2">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="flex-1">{showModelWarning}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-5 px-1 text-amber-700"
+            onClick={() => setShowModelWarning(null)}
+          >
+            <X className="h-3 w-3" />
+          </Button>
+        </div>
+      )}
+
+      {/* 附件预览 */}
+      {attachedFile && (
+        <div className="mb-2 flex items-center gap-2 p-2 bg-muted/50 rounded-lg border border-border">
+          {attachedFile.type.startsWith("image/") ? (
+            <div className="relative group w-12 h-12 rounded overflow-hidden shrink-0">
+              <img
+                src={attachedFile.preview}
+                alt={attachedFile.name}
+                className="w-full h-full object-cover"
+              />
+            </div>
+          ) : (
+            <div className="w-12 h-12 flex items-center justify-center bg-muted rounded shrink-0">
+              <FileText className="h-6 w-6 text-muted-foreground" />
+            </div>
+          )}
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium truncate">{attachedFile.name}</p>
+            <p className="text-xs text-muted-foreground">{formatFileSize(attachedFile.size)}</p>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 shrink-0"
+            onClick={removeAttachedFile}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+      )}
+
+      {/* 模型选择和按钮行 */}
       <div className="mb-2 flex items-center justify-between flex-wrap gap-2">
-        <div className="flex items-center gap-2">
           <Select value={selectedModel} onValueChange={(value) => value && setModel(value)}>
             <SelectTrigger className="h-7 text-xs gap-1 text-muted-foreground hover:text-foreground border-0 bg-muted/50 rounded-lg">
               <Bot className="h-3.5 w-3.5" />
@@ -256,18 +411,38 @@ export default function ChatPage() {
               知识图谱
             </button>
           </div>
-        </div>
 
-        <span className="text-xs text-muted-foreground">
-          当前模型：{currentModel?.name || "未选择"}
-        </span>
-      </div>
+          <span className="text-xs text-muted-foreground">
+            当前模型：{currentModel?.name || "未选择"}
+          </span>
+        </div>
 
       <Card
         className="border-border/60 shadow-sm bg-card py-0 cursor-text"
         onClick={() => textareaRef.current?.focus()}
       >
+        {/* 隐藏的文件输入框 */}
+        <input
+          type="file"
+          ref={fileInputRef}
+          accept="image/*,.pdf,.doc,.docx,.txt"
+          className="hidden"
+          onChange={handleFileSelect}
+        />
         <div className="flex items-end gap-2 p-3">
+          {/* 上传按钮 */}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={(e) => {
+              e.stopPropagation();
+              fileInputRef.current?.click();
+            }}
+            className="h-9 w-9 shrink-0 rounded-full hover:bg-muted"
+            title="上传文件"
+          >
+            <Paperclip className="h-4 w-4" />
+          </Button>
           <Textarea
             ref={textareaRef}
             value={input}
@@ -296,7 +471,7 @@ export default function ChatPage() {
                 e.stopPropagation();
                 handleSend();
               }}
-              disabled={!input.trim() || isStreaming}
+              disabled={!input.trim() && !attachedFile || isStreaming}
               className="h-9 w-9 shrink-0 rounded-full"
             >
               <Send className="h-4 w-4" />
