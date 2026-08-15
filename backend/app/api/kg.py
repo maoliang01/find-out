@@ -2714,8 +2714,10 @@ def _serialize_insight_alert(alert: InsightAlert) -> Dict[str, Any]:
         "severity": alert.severity,
         "status": alert.status,
         "confidence": alert.confidence,
+        "independent_source_count": alert.independent_source_count,
         "evidence_article_ids": alert.evidence_article_ids or [],
         "signal_reasons": alert.signal_reasons or [],
+        "risk_assessment": alert.risk_assessment or {},
         "match_evidence": alert.match_evidence or {},
         "review_note": alert.review_note,
         "first_seen_at": alert.first_seen_at.isoformat() if alert.first_seen_at else None,
@@ -2914,9 +2916,25 @@ async def predict_discovered_event(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="审核材料中包含不属于当前候选事件的文章",
         )
+    syndicated_ids = {
+        str(item.get("id")) for item in original_evidence
+        if item.get("id") and item.get("article_role") == "syndication"
+    }
+    if syndicated_ids.intersection(selected_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="转载材料仅用于传播溯源，不能作为交叉推演证据",
+        )
     selected_evidence = [item for item in original_evidence if str(item.get("id")) in selected_ids]
     if len(selected_evidence) < 2:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="该候选事件只有单篇证据，暂不进行交叉预测")
+    selected_sources = {str(item.get("source_domain") or "") for item in selected_evidence}
+    selected_sources.discard("")
+    if len(selected_sources) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="交叉推演至少需要两篇来自不同独立来源的材料",
+        )
     reviewed_event = {**event, "evidence_articles": selected_evidence}
     evidence_ids = [item.get("id") for item in selected_evidence if item.get("id")]
     article_rows = db.query(Article).filter(Article.id.in_(evidence_ids)).all() if evidence_ids else []
@@ -2943,6 +2961,7 @@ async def predict_discovered_event(
             prediction_type=request.prediction_type,
             model_id=request.model_id,
         )
+        result.knowledge_basis = result.knowledge_basis or {}
         result.knowledge_basis.update({
             "evidence_article_ids": selected_ids,
             "excluded_article_ids": [item_id for item_id in original_ids if item_id not in selected_ids],

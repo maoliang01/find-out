@@ -2,6 +2,7 @@
 
 import hashlib
 import re
+import jieba
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -9,6 +10,7 @@ from urllib.parse import urlparse, urlunparse
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.article import Article, ArticleKeyword
+from app.services.risk_detection import detect_risk
 
 
 class EventDiscoveryService:
@@ -42,6 +44,13 @@ class EventDiscoveryService:
         "20", "24", "23", "22", "21", "25", "26",
     ])
 
+    # Publisher suffixes and generic newsroom labels must never become title
+    # anchors.  In particular, character bigrams around separators used to
+    # produce fragments such as "涨界" and "闻快".
+    _TITLE_STOPWORDS = _STOPWORDS | frozenset({
+        "界面", "新闻", "快讯", "资讯", "消息", "报道", "记者", "发布",
+    })
+
     @staticmethod
     def _canonical_url(url: str) -> str:
         parsed = urlparse(url or "")
@@ -58,6 +67,18 @@ class EventDiscoveryService:
         words.update(compact[i:i + 2] for i in range(max(0, len(compact) - 1)))
         return {word for word in words
                 if len(word) >= 2 and word not in EventDiscoveryService._STOPWORDS}
+
+    @staticmethod
+    def _title_tokens(text: str) -> set[str]:
+        """Extract displayable title terms without crossing Chinese word boundaries."""
+        words: set[str] = set()
+        for segment in jieba.lcut(text or ""):
+            words.update(re.findall(r"[A-Za-z0-9+#.-]{2,}|[\u4e00-\u9fff]{2,}", segment))
+        return {
+            word for word in words
+            if word not in EventDiscoveryService._TITLE_STOPWORDS
+            and re.search(r"[A-Za-z0-9\u4e00-\u9fff]", word)
+        }
 
     @staticmethod
     def _article_date(article: Article) -> datetime:
@@ -80,7 +101,7 @@ class EventDiscoveryService:
             if link.keyword and str(link.keyword.name).strip()
         }
         return {
-            "title": cls._tokens(title),
+            "title": cls._title_tokens(title),
             "summary": cls._tokens(summary),
             "body": cls._tokens(body),
             "keywords": keyword_tokens,
@@ -218,17 +239,22 @@ class EventDiscoveryService:
                     duplicate_count += 1
                     continue
                 deduped.append(article)
+            # Syndicated copies are provenance, not independent corroboration.
+            independent_evidence = [
+                article for article in deduped
+                if (article.article_role or "original") != "syndication"
+            ] or deduped[:1]
             independent_sources = {
                 self._source_name(article.url) or f"article:{article.id}"
-                for article in deduped
+                for article in independent_evidence
             }
 
             # 选来源去重后覆盖文章数最多的命题作为代表，只形成一个交叉事件
             representative = max(
-                deduped,
+                independent_evidence,
                 key=lambda a: sum(
                     1 if self._match_evidence(profiles[a.id], profiles[o.id]) else 0
-                    for o in deduped
+                    for o in independent_evidence
                 ),
             )
             title = (representative.title or "").strip()
@@ -237,6 +263,10 @@ class EventDiscoveryService:
             marker_text = f"{title} {(representative.summary or '')} {(representative.content or '')[:1200]}"
             marker_hits = [marker for marker in self.EVENT_MARKERS if marker in marker_text]
             evidence_articles = sorted(deduped, key=lambda a: a.scraped_at or datetime.min, reverse=True)
+            risk = detect_risk("\n".join(
+                f"{item.title or ''}\n{item.summary or item.content or ''}"
+                for item in independent_evidence
+            ))
             pair_matches = [
                 self._match_evidence(profiles[representative.id], profiles[item.id])
                 for item in evidence_articles
@@ -293,6 +323,7 @@ class EventDiscoveryService:
                     "shared_title_terms": shared_title_terms,
                     "max_time_gap_days": max((item["gap_days"] for item in pair_matches), default=0),
                 },
+                "risk_assessment": risk,
                 "independent_source_count": len(independent_sources),
                 "duplicate_count": duplicate_count,
                 "evidence_articles": [{
@@ -303,6 +334,8 @@ class EventDiscoveryService:
                     "scraped_at": source.scraped_at.isoformat() if source.scraped_at else None,
                     "url": source.url,
                     "source_domain": self._source_name(source.url),
+                    "article_role": source.article_role or "original",
+                    "duplicate_group_id": source.duplicate_group_id,
                 } for source in evidence_articles],
                 "discovered_at": datetime.utcnow().isoformat(),
             })

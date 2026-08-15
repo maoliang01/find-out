@@ -652,6 +652,7 @@ async def run_task_now(task_id: str, db: Session = Depends(get_db)):
                 ).first()
                 if source:
                     category_id = source.category_id
+            worker_db.rollback()
 
             scraper = get_scraper()
             options = ScrapeOptions.for_background_task(IMMEDIATE_PAGE_TIMEOUT_SECONDS)
@@ -694,6 +695,10 @@ async def run_task_now(task_id: str, db: Session = Depends(get_db)):
                                 title = result.title or "无标题"
                                 scraped_articles.append(title)
                                 logger.info(f"    [立即执行] 已保存: {title[:50]}")
+                            else:
+                                message = f"保存失败 {result.url}: {article_id}"
+                                errors.append(message)
+                                logger.error(f"    [立即执行] {message}")
 
                 except Exception as url_error:
                     logger.error(f"  [立即执行] 爬取失败: {url_error}")
@@ -714,6 +719,7 @@ async def run_task_now(task_id: str, db: Session = Depends(get_db)):
                 asyncio.set_event_loop(None)
 
             try:
+                worker_db.rollback()
                 history_obj = worker_db.query(ScrapeHistory).filter(
                     ScrapeHistory.id == history_id
                 ).first()

@@ -205,6 +205,9 @@ def run_scheduled_task(task_id: str):
         logger.info(f"⏰ [定时执行] 任务执行时间: {task.schedule_time}")
         logger.info(f"⏰ [定时执行] 上次执行时间: {task.last_run_at}")
         logger.info(f"⏰ [定时执行] 下次执行时间: {task.next_run_at}")
+        task_name = task.name
+        task_scrape_range = task.scrape_range
+        task_schedule_time = task.schedule_time
 
         # 检查是否有同任务正在运行（防止重复执行）
         running_count = db.query(ScrapeHistory).filter(
@@ -227,8 +230,13 @@ def run_scheduled_task(task_id: str):
         )
         db.add(history)
         db.flush()
+        # SQLite only permits one writer.  Persist the RUNNING marker now so
+        # article saves performed through their own sessions are not blocked
+        # for the entire crawl duration.
+        db.commit()
+        db.refresh(history)
 
-        logger.info(f"⏰ [定时执行] 任务 '{task.name}' 开始爬取...")
+        logger.info(f"⏰ [定时执行] 任务 '{task_name}' 开始爬取...")
 
         # 执行爬取
         try:
@@ -258,6 +266,11 @@ def run_scheduled_task(task_id: str):
                     if result:
                         urls.append(result[0])
 
+            # End the source lookup transaction before per-article sessions
+            # begin writing.  This also avoids a stale WAL read snapshot being
+            # upgraded to a writer at task completion.
+            db.rollback()
+
             total_articles = 0
             scraper = get_scraper()
 
@@ -283,7 +296,7 @@ def run_scheduled_task(task_id: str):
                             url=url,
                             options=options,
                             max_articles=SCHEDULED_MAX_ARTICLES,
-                            date_range=task.scrape_range,
+                            date_range=task_scrape_range,
                             timeout_seconds=0,  # 0 表示不限时
                         )
                     )
@@ -306,6 +319,10 @@ def run_scheduled_task(task_id: str):
                                 title = result.title or "无标题"
                                 scraped_articles.append(title)
                                 logger.info(f"      ✓ 已保存: {title[:50]}")
+                            else:
+                                message = f"保存失败 {result.url}: {article_id}"
+                                errors.append(message)
+                                logger.error(f"      ✗ {message}")
                         else:
                             logger.info(f"    内容不足，跳过: {result.url}")
 
@@ -316,6 +333,7 @@ def run_scheduled_task(task_id: str):
             loop.close()
 
             # 更新历史记录 - 使用列表格式显示所有文章标题
+            db.rollback()
             end_time = datetime.utcnow()
             duration = (end_time - start_time).total_seconds()
 
@@ -333,7 +351,7 @@ def run_scheduled_task(task_id: str):
 
             history.status = (
                 TaskStatus.FAILED.value
-                if errors and completed_urls == 0
+                if errors and total_articles == 0
                 else TaskStatus.SUCCESS.value
             )
             history.error_message = "\n".join(errors)[:4000] if errors else None
@@ -343,15 +361,16 @@ def run_scheduled_task(task_id: str):
             history.articles_count = total_articles
             history.url = ", ".join(urls[:3]) + ("..." if len(urls) > 3 else "")
             task.last_run_at = datetime.utcnow()
-            task.next_run_at = _calculate_next_run(task.schedule_time)
+            task.next_run_at = _calculate_next_run(task_schedule_time)
             db.commit()
 
-            logger.info(f"✅ [定时执行] 任务 '{task.name}' 完成！保存了 {total_articles} 篇文章，耗时 {duration:.1f}秒")
+            logger.info(f"✅ [定时执行] 任务 '{task_name}' 完成！保存了 {total_articles} 篇文章，耗时 {duration:.1f}秒")
 
         except Exception as e:
-            logger.error(f"❌ [定时执行] 任务 '{task.name}' 执行失败: {e}")
+            logger.error(f"❌ [定时执行] 任务 '{task_name}' 执行失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            db.rollback()
             history.status = TaskStatus.FAILED.value
             history.error_message = str(e)
             history.started_at = start_time

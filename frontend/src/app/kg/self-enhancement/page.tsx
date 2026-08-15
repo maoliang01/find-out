@@ -17,6 +17,14 @@ interface EventEvidence {
   published_at?: string | null
   scraped_at?: string | null
   source_domain?: string
+  article_role?: string
+  duplicate_group_id?: string | null
+}
+
+interface RiskAssessment {
+  categories: string[]
+  severity: number
+  evidence: Array<{ category: string; term: string; evidence: string }>
 }
 
 interface DiscoveredEvent {
@@ -30,6 +38,7 @@ interface DiscoveredEvent {
   signal_reasons: string[]
   independent_source_count?: number
   duplicate_count?: number
+  risk_assessment?: RiskAssessment
   match_evidence?: {
     average_similarity: number
     shared_keywords: string[]
@@ -178,8 +187,10 @@ interface InsightAlert {
   title: string
   severity: 'low' | 'medium' | 'high'
   confidence: number
+  independent_source_count?: number
   evidence_article_ids: string[]
   signal_reasons: string[]
+  risk_assessment?: RiskAssessment
   match_evidence?: { average_similarity?: number; max_time_gap_days?: number }
   first_seen_at?: string | null
 }
@@ -235,6 +246,24 @@ const relationLabels: Record<string, string> = {
   supports: '支持',
   contradicts: '矛盾',
   extends: '延伸',
+}
+
+const riskCategoryLabels: Record<string, string> = {
+  safety_incident: '安全事故',
+  regulatory: '监管合规',
+  delivery: '履约交付',
+  reputation: '声誉投诉',
+  data_security: '数据安全',
+}
+
+function primaryEvidence(event: DiscoveredEvent) {
+  return event.evidence_articles.filter((article) => article.article_role !== 'syndication')
+}
+
+function riskLevelLabel(score?: number) {
+  if ((score || 0) >= 80) return '高风险'
+  if ((score || 0) >= 55) return '中风险'
+  return '观察'
 }
 
 async function readJson(response: Response) {
@@ -301,7 +330,10 @@ export default function SelfEnhancementPage() {
       setSelectedEvidenceByEvent((current) => {
         const next = { ...current }
         for (const event of discoveredEvents) {
-          if (!next[event.id]) next[event.id] = event.evidence_articles.map((article) => article.id)
+          if (!next[event.id]) {
+            const ids = primaryEvidence(event).map((article) => article.id)
+            next[event.id] = ids.length ? ids : event.evidence_articles.map((article) => article.id)
+          }
         }
         return next
       })
@@ -523,8 +555,12 @@ export default function SelfEnhancementPage() {
   }
 
   const predictEvent = async (event: DiscoveredEvent) => {
-    const articleIds = selectedEvidenceByEvent[event.id] || event.evidence_articles.map((article) => article.id)
-    if (articleIds.length < 2) {
+    const articleIds = selectedEvidenceByEvent[event.id] || primaryEvidence(event).map((article) => article.id)
+    const selectedSources = new Set(primaryEvidence(event)
+      .filter((article) => articleIds.includes(article.id))
+      .map((article) => article.source_domain)
+      .filter(Boolean))
+    if (articleIds.length < 2 || selectedSources.size < 2) {
       alert('交叉推演至少需要保留两个独立来源，请重新审核材料。')
       return
     }
@@ -563,7 +599,10 @@ export default function SelfEnhancementPage() {
           }
         }
       }
-      setPrediction(result)
+      // The prediction endpoint may return a partial result when an upstream
+      // analysis is unavailable. Keep the result view reviewable instead of
+      // allowing an omitted optional object to crash the page.
+      setPrediction({ ...result, knowledge_basis: result.knowledge_basis || {} })
       await loadHistory()
     } catch (error) {
       alert(error instanceof DOMException && error.name === 'AbortError' ? '深度分析请求超时，请稍后重试。系统不会用固定模板替代分析结果。' : error instanceof Error ? error.message : '交叉分析失败')
@@ -609,7 +648,7 @@ export default function SelfEnhancementPage() {
         </style>
         <h1>多源事件综合推演报告</h1><p>${escapeReportHtml(prediction.topic)}</p>
         <p class="meta">生成时间：${escapeReportHtml(new Date(prediction.generated_at || Date.now()).toLocaleString('zh-CN'))}　分析模型：${escapeReportHtml(modelName)}</p>
-        <p class="meta">证据支持度：${escapeReportHtml(prediction.knowledge_basis.support_level || '待评估')}（${Math.round(prediction.confidence * 100)}分）　材料：${prediction.knowledge_basis.evidence_articles || 0}篇　独立来源：${prediction.knowledge_basis.independent_sources || 0}个　知识点：${prediction.knowledge_basis.knowledge_points || 0}个　已审核关系：${prediction.knowledge_basis.cross_document_relations || 0}条</p>
+        <p class="meta">证据支持度：${escapeReportHtml(predictionKnowledgeBasis.support_level || '待评估')}（${Math.round(prediction.confidence * 100)}分）　材料：${predictionKnowledgeBasis.evidence_articles || 0}篇　独立来源：${predictionKnowledgeBasis.independent_sources || 0}个　知识点：${predictionKnowledgeBasis.knowledge_points || 0}个　已审核关系：${predictionKnowledgeBasis.cross_document_relations || 0}条</p>
         <div class="summary"><h3>核心研判</h3><p>${escapeReportHtml(interpretation.executive_judgment)}</p><p>${escapeReportHtml(interpretation.event_summary)}</p></div>
         <h2>信号含义</h2><p><strong>${escapeReportHtml(interpretation.signal_assessment?.label)}</strong>　${escapeReportHtml(interpretation.signal_assessment?.meaning)}</p><p>${escapeReportHtml(interpretation.signal_assessment?.evidence)}</p>
         <h2>下一步事件推演</h2>${developments || '<p class="empty">暂无</p>'}
@@ -619,7 +658,7 @@ export default function SelfEnhancementPage() {
         <h2>媒体舆情走向</h2>${publicOpinionHtml}
         <h2>推动因素</h2>${reportList(interpretation.drivers)}<h2>推演失效风险</h2>${reportList(interpretation.risks)}
         <h2>下一步跟踪指标</h2>${reportList(interpretation.watch_indicators)}
-        <h2>来源文章</h2>${reportList(prediction.knowledge_basis.evidence_titles)}
+        <h2>来源文章</h2>${reportList(predictionKnowledgeBasis.evidence_titles)}
         <div class="footer">本报告区分来源事实与模型推断，仅用于线索研判和持续跟踪，不作为确定性决策依据。</div>`
       document.body.appendChild(report)
       const canvas = await html2canvas(report, {
@@ -701,7 +740,10 @@ export default function SelfEnhancementPage() {
     if (response.ok) await loadHistory()
   }
 
-  const multiDocumentEvents = events.filter((event) => event.evidence_articles.length >= 2)
+  const predictionKnowledgeBasis: PredictionResult['knowledge_basis'] = prediction?.knowledge_basis || {}
+  const multiDocumentEvents = events.filter((event) => (event.independent_source_count || 0) >= 2)
+  const observationEvents = events.filter((event) => (event.independent_source_count || 0) < 2)
+  const orderedEvents = [...multiDocumentEvents, ...observationEvents]
   const evidenceCoverage = stats?.quality_metrics?.knowledge_points?.evidence_coverage || 0
 
   return (
@@ -744,7 +786,8 @@ export default function SelfEnhancementPage() {
         </div>
         <div className="mt-3 space-y-2">
           {insightAlerts.map((alert) => <div key={alert.id} className="flex flex-wrap items-center justify-between gap-3 border-t border-amber-200 pt-3 first:border-t-0 first:pt-0">
-            <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{alert.title}</span><Badge variant="outline">{alert.severity === 'high' ? '高优先级' : alert.severity === 'medium' ? '中优先级' : '低优先级'}</Badge></div><p className="mt-1 text-xs text-amber-900/80">{alert.evidence_article_ids.length} 个独立来源 · 证据支持度 {Math.round(alert.confidence * 100)}%{alert.match_evidence?.max_time_gap_days !== undefined ? ` · 最大时间间隔 ${alert.match_evidence.max_time_gap_days} 天` : ''}</p></div>
+            <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{alert.title}</span><Badge variant={alert.severity === 'high' ? 'destructive' : 'outline'}>{alert.severity === 'high' ? '高优先级' : alert.severity === 'medium' ? '中优先级' : '低优先级'}</Badge></div><p className="mt-1 text-xs text-amber-900/80">证据文章 {alert.evidence_article_ids.length} 篇 · 独立来源 {alert.independent_source_count ?? 0} 个 · 证据支持度 {Math.round(alert.confidence * 100)}%{alert.match_evidence?.max_time_gap_days !== undefined ? ` · 最大时间间隔 ${alert.match_evidence.max_time_gap_days} 天` : ''}</p></div>
+            <div className="min-w-0 flex-1 text-xs text-amber-900/80">{alert.risk_assessment?.categories?.length ? <details><summary className="cursor-pointer">风险类别：{alert.risk_assessment.categories.map((category) => riskCategoryLabels[category] || category).join('、')}</summary>{alert.risk_assessment.evidence?.length ? <div className="mt-1 space-y-1 border-l border-amber-300 pl-2">{alert.risk_assessment.evidence.map((item, index) => <p key={`${item.category}-${item.term}-${index}`}>{item.term}：{item.evidence}</p>)}</div> : null}</details> : <span>未命中已配置的风险规则</span>}</div>
             <div className="flex gap-2"><Button size="sm" variant="outline" disabled={reviewingAlertId === alert.id} onClick={() => reviewInsightAlert(alert.id, 'acknowledged')}>确认跟踪</Button><Button size="sm" variant="ghost" disabled={reviewingAlertId === alert.id} onClick={() => reviewInsightAlert(alert.id, 'dismissed')}>忽略</Button></div>
           </div>)}
         </div>
@@ -815,18 +858,29 @@ export default function SelfEnhancementPage() {
               </Button>
             </CardHeader>
             <CardContent className="space-y-3">
-              {!multiDocumentEvents.length ? (
+              {events.length > 0 && <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-md border bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                <span><strong className="text-slate-900">{multiDocumentEvents.length}</strong> 个多源确认事件，可进入交叉推演</span>
+                <span><strong className="text-slate-900">{observationEvents.length}</strong> 个单源观察信号，仅用于持续跟踪</span>
+              </div>}
+              {!events.length ? (
                 <div className="rounded border border-dashed p-8 text-center text-sm text-gray-500">
-                  暂无多来源候选事件。当前只有单源信号，证据不足时系统不会用知识综合内容代替交叉发现。
+                  暂无候选事件，请先采集文章或扩大事件发现的时间范围。
                 </div>
-              ) : multiDocumentEvents.map((event) => (
-                <div key={event.id} className="rounded-lg border p-4">
+              ) : orderedEvents.map((event, eventIndex) => (
+                <div key={event.id} className={`rounded-lg border p-4 ${(event.independent_source_count || 0) >= 2 ? 'border-blue-200 bg-white' : 'border-slate-200 bg-slate-50/40'}`}>
+                  {(eventIndex === 0 || eventIndex === multiDocumentEvents.length) && <div className="mb-3 flex items-center gap-2 border-b pb-2 text-xs font-medium text-slate-600">
+                    {(event.independent_source_count || 0) >= 2 ? <><CheckCircle2 className="h-3.5 w-3.5 text-blue-600" />多源确认事件</> : <><AlertCircle className="h-3.5 w-3.5 text-slate-500" />单源观察信号</>}
+                  </div>}
                   <div className="flex flex-wrap items-start justify-between gap-4">
                     <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold">{event.title}</h3><Badge variant={event.signal_type === 'cross_document' ? 'default' : 'secondary'}>{event.signal_type === 'cross_document' ? '多来源交叉确认' : '单源时序分析'}</Badge></div>
+                      <div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold">{event.title}</h3><Badge variant={(event.independent_source_count || 0) >= 2 ? 'default' : 'secondary'}>{(event.independent_source_count || 0) >= 2 ? '多来源交叉确认' : '单源观察 · 证据不足'}</Badge></div>
                       <p className="mt-1 text-sm text-gray-500">证据支持度 {Math.round(event.confidence * 100)}分 · 独立来源 {event.independent_source_count ?? event.evidence_articles.length} 个{event.duplicate_count ? ` · 已折叠重复内容 ${event.duplicate_count} 篇` : ''}</p>
                       <div className="mt-2 flex flex-wrap gap-2">{event.signal_reasons.map((reason) => <Badge key={reason} variant="outline">{reason}</Badge>)}</div>
                       {event.match_evidence && <p className="mt-2 text-xs leading-5 text-gray-500">匹配依据：相似度 {Math.round(event.match_evidence.average_similarity * 100)}% · 最大时间间隔 {event.match_evidence.max_time_gap_days} 天{event.match_evidence.shared_keywords.length ? ` · 共同关键词 ${event.match_evidence.shared_keywords.join('、')}` : ''}</p>}
+                      {event.risk_assessment && <div className="mt-3 rounded-md border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-950">
+                        <div className="flex flex-wrap items-center gap-2"><span className="font-medium">风险识别</span><Badge variant={event.risk_assessment.severity >= 80 ? 'destructive' : 'outline'}>{riskLevelLabel(event.risk_assessment.severity)} · {event.risk_assessment.severity} 分</Badge>{event.risk_assessment.categories.map((category) => <Badge key={category} variant="outline" className="border-amber-300 bg-white">{riskCategoryLabels[category] || category}</Badge>)}</div>
+                        {event.risk_assessment.evidence.length > 0 && <details className="mt-2"><summary className="cursor-pointer text-amber-800">查看命中依据（{event.risk_assessment.evidence.length}）</summary><div className="mt-2 space-y-1.5 border-l border-amber-300 pl-2">{event.risk_assessment.evidence.map((item, index) => <p key={`${item.category}-${item.term}-${index}`}><span className="font-medium">{riskCategoryLabels[item.category] || item.category} · {item.term}</span>：{item.evidence}</p>)}</div></details>}
+                      </div>}
                     </div>
                     <div className="flex flex-col items-end gap-2">
                       <Select value={timeRangeByEvent[event.id] || '30'} onValueChange={(value) => value && setTimeRangeByEvent((current) => ({ ...current, [event.id]: value }))}>
@@ -838,19 +892,20 @@ export default function SelfEnhancementPage() {
                           <SelectItem value="180">推演未来 180 天</SelectItem>
                         </SelectContent>
                       </Select>
-                      <Button onClick={() => predictEvent(event)} disabled={loadingEventId !== null || benchmarkingModels || !selectedAnalysisModel || (selectedEvidenceByEvent[event.id]?.length || 0) < 2}>
+                      <Button onClick={() => predictEvent(event)} disabled={(event.independent_source_count || 0) < 2 || loadingEventId !== null || benchmarkingModels || !selectedAnalysisModel || (selectedEvidenceByEvent[event.id]?.length || 0) < 2}>
                         {loadingEventId === event.id ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <TrendingUp className="mr-2 h-4 w-4" />}
-                        审核材料并生成推演
+                        {(event.independent_source_count || 0) >= 2 ? '审核材料并生成推演' : '等待第二独立来源'}
                       </Button>
                     </div>
                   </div>
-                  <details open className="mt-3 rounded bg-gray-50 p-3 text-sm">
-                    <summary className="cursor-pointer font-medium">审核参与推演的材料（已选 {selectedEvidenceByEvent[event.id]?.length || 0}/{event.evidence_articles.length}）</summary>
-                    <div className="mt-3 space-y-3">{event.evidence_articles.map((article) => {
+                  <details open={(event.independent_source_count || 0) >= 2} className="mt-3 rounded bg-gray-50 p-3 text-sm">
+                    <summary className="cursor-pointer font-medium">{(event.independent_source_count || 0) >= 2 ? `审核参与推演的材料（已选 ${selectedEvidenceByEvent[event.id]?.length || 0}/${primaryEvidence(event).length}）` : `查看观察材料（${primaryEvidence(event).length} 篇）`}</summary>
+                    <div className="mt-3 space-y-3">{primaryEvidence(event).map((article) => {
                       const checked = (selectedEvidenceByEvent[event.id] || []).includes(article.id)
                       return <label key={article.id} className="flex cursor-pointer items-start gap-3 border-b pb-3 last:border-0">
                         <Checkbox
                           checked={checked}
+                          disabled={(event.independent_source_count || 0) < 2}
                           onCheckedChange={(nextChecked) => setSelectedEvidenceByEvent((current) => {
                             const selected = new Set(current[event.id] || [])
                             if (nextChecked === true) selected.add(article.id)
@@ -862,6 +917,7 @@ export default function SelfEnhancementPage() {
                         <span className="min-w-0 flex-1"><span className="font-medium">{article.title}</span><span className="mt-1 block text-xs text-gray-500">{article.source_domain || '未知来源'}{article.published_at ? ` · ${article.published_at}` : ''}</span><span className="mt-1 block text-xs leading-5 text-gray-600">{article.summary || '无摘要'}</span></span>
                       </label>
                     })}</div>
+                    {event.evidence_articles.some((article) => article.article_role === 'syndication') && <details className="mt-3 border-t border-dashed pt-3 text-xs text-gray-600"><summary className="cursor-pointer font-medium text-gray-700">传播记录（转载，{event.evidence_articles.filter((article) => article.article_role === 'syndication').length} 篇；不参与交叉推演）</summary><div className="mt-2 space-y-2">{event.evidence_articles.filter((article) => article.article_role === 'syndication').map((article) => <div key={article.id} className="rounded border border-dashed bg-white p-2"><div className="flex items-center gap-2"><Badge variant="outline">转载</Badge><span className="font-medium">{article.title}</span></div><p className="mt-1 text-gray-500">{article.source_domain || '未知来源'}{article.published_at ? ` · ${article.published_at}` : ''}</p></div>)}</div></details>}
                   </details>
                 </div>
               ))}
@@ -888,24 +944,24 @@ export default function SelfEnhancementPage() {
                   推演会区分来源事实与模型推断。内部方向代码仅用于候选事件初筛，不代表股价、概率或必然结果，也不再作为面向用户的结论。
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Badge variant="outline">证据支持度：{prediction.knowledge_basis.support_level || '待评估'}（{Math.round(prediction.confidence * 100)}分）</Badge>
-                  <Badge variant="outline">来源：{prediction.knowledge_basis.evidence_articles || 0} 篇</Badge>
-                  <Badge variant="outline">独立来源：{prediction.knowledge_basis.independent_sources || 0} 个</Badge>
-                  <Badge variant="outline">知识点：{prediction.knowledge_basis.knowledge_points || 0} 个</Badge>
-                  <Badge variant="outline">已审核关系：{prediction.knowledge_basis.cross_document_relations || 0} 条</Badge>
+                  <Badge variant="outline">证据支持度：{predictionKnowledgeBasis.support_level || '待评估'}（{Math.round(prediction.confidence * 100)}分）</Badge>
+                  <Badge variant="outline">来源：{predictionKnowledgeBasis.evidence_articles || 0} 篇</Badge>
+                  <Badge variant="outline">独立来源：{predictionKnowledgeBasis.independent_sources || 0} 个</Badge>
+                  <Badge variant="outline">知识点：{predictionKnowledgeBasis.knowledge_points || 0} 个</Badge>
+                  <Badge variant="outline">已审核关系：{predictionKnowledgeBasis.cross_document_relations || 0} 条</Badge>
                   {prediction.interpretation?.analysis_model && <Badge variant="outline">模型：{analysisModels.find((model) => model.id === prediction.interpretation?.analysis_model)?.name || prediction.interpretation.analysis_model}</Badge>}
                 </div>
-                {prediction.knowledge_basis.confidence_note && <div className="flex gap-2 bg-slate-50 p-3 text-sm text-slate-700"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>{prediction.knowledge_basis.confidence_note}</span></div>}
+                {predictionKnowledgeBasis.confidence_note && <div className="flex gap-2 bg-slate-50 p-3 text-sm text-slate-700"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>{predictionKnowledgeBasis.confidence_note}</span></div>}
                 {!!prediction.interpretation?.quality_warnings?.length && <div className="flex gap-2 bg-amber-50 p-3 text-sm text-amber-800"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>系统已保留合格推演，并自动剔除 {prediction.interpretation.quality_warnings.length} 条不够具体的模型条目。</span></div>}
 
                 {prediction.interpretation?.analysis_status === 'unavailable' ? (
                   <div className="border-l-4 border-red-500 bg-red-50 p-4">
                     <div className="flex gap-3"><AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" /><div><h4 className="font-medium text-red-900">本次没有形成可用推演</h4><p className="mt-1 text-sm text-red-800">{prediction.interpretation.analysis_error || '模型未返回足够具体的分析，系统已拒绝展示通用模板。'}</p></div></div>
-                    <Button className="mt-3" size="sm" variant="outline" onClick={() => { const target = events.find((item) => item.id === prediction.knowledge_basis.event_id); if (target) predictEvent(target) }}>重新深度分析</Button>
+                    <Button className="mt-3" size="sm" variant="outline" onClick={() => { const target = events.find((item) => item.id === predictionKnowledgeBasis.event_id); if (target) predictEvent(target) }}>重新深度分析</Button>
                   </div>
                 ) : (
                   <>
-                    {(prediction.knowledge_basis.knowledge_points || 0) === 0 && <div className="flex gap-2 bg-amber-50 p-3 text-sm text-amber-800"><AlertCircle className="h-4 w-4 shrink-0" />当前没有结构化知识点或正式关系，推演主要依据多篇来源正文，结论需要结合下方验证指标持续校验。</div>}
+                    {(predictionKnowledgeBasis.knowledge_points || 0) === 0 && <div className="flex gap-2 bg-amber-50 p-3 text-sm text-amber-800"><AlertCircle className="h-4 w-4 shrink-0" />当前没有结构化知识点或正式关系，推演主要依据多篇来源正文，结论需要结合下方验证指标持续校验。</div>}
 
                     <section className="border-l-4 border-blue-600 bg-blue-50/50 p-4">
                       <div className="flex flex-wrap items-center justify-between gap-2"><h4 className="font-semibold">核心研判</h4><Badge variant="outline">{prediction.interpretation?.current_phase || '阶段待判断'}</Badge></div>
@@ -936,7 +992,7 @@ export default function SelfEnhancementPage() {
 
                     <section className="border-t pt-5"><h4 className="font-semibold">下一步跟踪指标</h4><div className="mt-2 flex flex-wrap gap-2">{(prediction.interpretation?.watch_indicators || []).map((item) => <Badge key={item} variant="outline" className="whitespace-normal text-left font-normal">{item}</Badge>)}</div>{prediction.interpretation?.decision_value && <div className="mt-4 bg-slate-50 p-3 text-sm"><strong>决策用途：{prediction.interpretation.decision_value.category}</strong><p className="mt-1 text-gray-600">{prediction.interpretation.decision_value.explanation}</p></div>}</section>
 
-                    <details className="border-t pt-4"><summary className="cursor-pointer text-sm font-medium">查看参与判断的知识证据</summary><div className="mt-3 space-y-3 text-sm text-gray-600"><div><p className="font-medium text-gray-800">来源文章</p>{prediction.knowledge_basis.evidence_titles?.map((title) => <p key={title} className="mt-1">· {title}</p>)}</div><div><p className="font-medium text-gray-800">结构化知识点</p>{prediction.knowledge_basis.knowledge_point_details?.map((point, index) => <div key={`${point.title}-${index}`} className="mt-2 border-l-2 pl-3"><div className="font-medium text-gray-800">{point.title} <span className="text-xs text-gray-500">（{categoryLabels[point.category] || point.category}）</span></div><p className="mt-1">{point.content}</p>{point.evidence && <p className="mt-1 text-xs text-gray-500">原文依据：{point.evidence}</p>}</div>)}</div>{(prediction.knowledge_basis.relation_details || []).length > 0 && <div><p className="font-medium text-gray-800">已审核关系</p>{prediction.knowledge_basis.relation_details?.map((relation, index) => <div key={`${relation.source}-${relation.target}-${index}`} className="mt-2 border-l-2 pl-3"><p className="font-medium text-gray-800">{relation.source} → {relation.target} <span className="text-xs text-gray-500">（{relationLabels[relation.type] || relation.type}）</span></p>{relation.evidence && <p className="mt-1 text-xs text-gray-500">关系依据：{relation.evidence}</p>}</div>)}</div>}</div></details>
+                    <details className="border-t pt-4"><summary className="cursor-pointer text-sm font-medium">查看参与判断的知识证据</summary><div className="mt-3 space-y-3 text-sm text-gray-600"><div><p className="font-medium text-gray-800">来源文章</p>{predictionKnowledgeBasis.evidence_titles?.map((title) => <p key={title} className="mt-1">· {title}</p>)}</div><div><p className="font-medium text-gray-800">结构化知识点</p>{predictionKnowledgeBasis.knowledge_point_details?.map((point, index) => <div key={`${point.title}-${index}`} className="mt-2 border-l-2 pl-3"><div className="font-medium text-gray-800">{point.title} <span className="text-xs text-gray-500">（{categoryLabels[point.category] || point.category}）</span></div><p className="mt-1">{point.content}</p>{point.evidence && <p className="mt-1 text-xs text-gray-500">原文依据：{point.evidence}</p>}</div>)}</div>{(predictionKnowledgeBasis.relation_details || []).length > 0 && <div><p className="font-medium text-gray-800">已审核关系</p>{predictionKnowledgeBasis.relation_details?.map((relation, index) => <div key={`${relation.source}-${relation.target}-${index}`} className="mt-2 border-l-2 pl-3"><p className="font-medium text-gray-800">{relation.source} → {relation.target} <span className="text-xs text-gray-500">（{relationLabels[relation.type] || relation.type}）</span></p>{relation.evidence && <p className="mt-1 text-xs text-gray-500">关系依据：{relation.evidence}</p>}</div>)}</div>}</div></details>
                   </>
                 )}
               </CardContent>

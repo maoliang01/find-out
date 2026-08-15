@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app.services.alternate_scraper import strip_semantic_noise_blocks
+from app.services.site_router import RouteDecision, get_site_strategy_router
 
 APP_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -1129,6 +1130,32 @@ class DateExtractor:
                 if cls._validate_date(date_str):
                     return date_str
 
+        # 5. 相对发布时间（例如“14小时前”“30分钟前”）。不少动态新闻站
+        # 不输出绝对日期；这仍是页面明确给出的发布时间，不能因此被日期筛选
+        # 误判为范围外。仅接受有限的、常见的相对时间单位，避免将正文中的
+        # 任意时间描述当作发布时间。
+        relative_patterns = (
+            (r'(?<!\d)(\d{1,3})\s*(?:分钟前|分钟之前|minutes?\s+ago)', "minutes"),
+            (r'(?<!\d)(\d{1,3})\s*(?:小时前|小时之前|hours?\s+ago)', "hours"),
+            (r'(?:昨天|昨日)\s*(?:\d{1,2}[:：]\d{2})?', "days"),
+        )
+        for pattern, unit in relative_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                if unit == "minutes":
+                    published = (datetime.now(APP_TIMEZONE) - timedelta(minutes=int(match.group(1)))).date()
+                elif unit == "hours":
+                    published = (datetime.now(APP_TIMEZONE) - timedelta(hours=int(match.group(1)))).date()
+                else:
+                    published = current_local_date() - timedelta(days=1)
+                date_str = published.isoformat()
+                if cls._validate_date(date_str):
+                    return date_str
+            except (TypeError, ValueError):
+                continue
+
         return None
 
     @classmethod
@@ -1891,8 +1918,91 @@ class WebScraper:
         self._cancel_event = cancel_event
         self._firecrawl = get_firecrawl_client()
         self._progress_callback = progress_callback
-        self._use_crawl4ai = False  # 是否使用 crawl4ai 作为回退
-        self._use_alternate = False  # 是否使用内置备用爬取方案
+        self._site_router = get_site_strategy_router()
+
+    def _route_for(self, url: str, html: str = "", cookies: Optional[str] = None) -> RouteDecision:
+        """Classify each URL independently; never leak one site's fallback to another."""
+        return self._site_router.classify(url, html=html, cookies=cookies)
+
+    @staticmethod
+    def _strategy_result_usable(result: Optional[Dict[str, Any]]) -> bool:
+        if not result or not result.get("success"):
+            return False
+        content = str(result.get("content") or result.get("markdown") or "").strip()
+        html = str(result.get("html") or "")
+        links = result.get("links") or []
+        return len(content) >= 50 or len(html) >= 500 or bool(links)
+
+    async def _run_strategy_chain(
+        self,
+        url: str,
+        options: ScrapeOptions,
+        cookies: Optional[str],
+        decision: RouteDecision,
+    ) -> Dict[str, Any]:
+        """Execute the route's ordered strategies and preserve attempt diagnostics."""
+        attempts: List[Dict[str, Any]] = []
+        last_result: Dict[str, Any] = {"success": False, "error": "没有可用的爬取策略"}
+
+        for strategy in decision.strategies:
+            if self._is_cancelled():
+                return {"success": False, "error": "爬取已取消"}
+            if strategy == "firecrawl" and not self._firecrawl.is_configured():
+                attempts.append({"strategy": strategy, "status": "skipped", "reason": "not_configured"})
+                continue
+
+            started = time.monotonic()
+            try:
+                if strategy == "http":
+                    candidate = await self._scrape_with_alternate(url, options, cookies)
+                elif strategy == "browser":
+                    candidate = await Crawl4AIWrapper.scrape(
+                        url, timeout=options.timeout, cookies=cookies
+                    )
+                elif strategy == "firecrawl":
+                    candidate = await self._firecrawl.scrape_url(url, timeout=options.timeout)
+                else:
+                    continue
+            except Exception as exc:
+                candidate = {"success": False, "error": str(exc)}
+
+            duration_ms = round((time.monotonic() - started) * 1000)
+            attempts.append({
+                "strategy": strategy,
+                "status": "success" if candidate.get("success") else "failed",
+                "duration_ms": duration_ms,
+                "content_length": len(str(candidate.get("content") or candidate.get("markdown") or "")),
+                "html_length": len(str(candidate.get("html") or "")),
+                "link_count": len(candidate.get("links") or []),
+                "error": candidate.get("error"),
+            })
+            last_result = candidate
+            if self._strategy_result_usable(candidate):
+                metadata = dict(candidate.get("metadata") or {})
+                metadata["crawl_route"] = {
+                    **decision.to_dict(),
+                    "selected_strategy": strategy,
+                    "attempts": attempts,
+                }
+                candidate["metadata"] = metadata
+                logger.info(
+                    "站点路由完成: url=%s type=%s rule=%s strategy=%s attempts=%s",
+                    url,
+                    decision.site_type,
+                    decision.rule_name,
+                    strategy,
+                    len(attempts),
+                )
+                return candidate
+
+        metadata = dict(last_result.get("metadata") or {})
+        metadata["crawl_route"] = {
+            **decision.to_dict(),
+            "selected_strategy": None,
+            "attempts": attempts,
+        }
+        last_result["metadata"] = metadata
+        return last_result
 
     def _is_cancelled(self) -> bool:
         """检查是否已取消"""
@@ -2403,39 +2513,30 @@ class WebScraper:
                     logger.warning(f"澎湃快速抓取异常，回退通用链路: {url}, {fast_error}")
                     scrape_result = None
 
-            if scrape_result is not None:
-                pass
-            elif self._use_alternate:
-                # 使用内置备用爬取方案
-                scrape_result = await self._scrape_with_alternate(url, options, cookies)
-            elif self._use_crawl4ai:
-                # 使用 Crawl4AI
-                scrape_result = await Crawl4AIWrapper.scrape(url, timeout=options.timeout, cookies=cookies)
+            if scrape_result is None:
+                decision = self._route_for(url, cookies=cookies)
+                logger.info(
+                    "站点识别: url=%s type=%s rule=%s strategies=%s reason=%s",
+                    url,
+                    decision.site_type,
+                    decision.rule_name,
+                    ",".join(decision.strategies),
+                    decision.reason,
+                )
+                scrape_result = await self._run_strategy_chain(url, options, cookies, decision)
             else:
-                # Firecrawl 未配置时直接短路（避免每次白等 1-2 秒拿 401）
-                if not self._firecrawl.is_configured():
-                    logger.info(f"Firecrawl 未配置（无 API key 也未启用本地服务），直接走 Crawl4AI: {url}")
-                    self._use_crawl4ai = True
-                    scrape_result = await Crawl4AIWrapper.scrape(url, timeout=options.timeout, cookies=cookies)
-                else:
-                    # 使用 Firecrawl
-                    scrape_result = await self._firecrawl.scrape_url(url, timeout=options.timeout)
-
-            # 2. Firecrawl 失败时自动回退到 Crawl4AI
-            if not scrape_result.get("success") and not self._use_crawl4ai and not self._use_alternate:
-                logger.warning(f"Firecrawl 爬取失败，回退到 Crawl4AI: {url}")
-                scrape_result = await Crawl4AIWrapper.scrape(url, timeout=options.timeout, cookies=cookies)
-                if scrape_result.get("success"):
-                    self._use_crawl4ai = True  # 后续继续使用 crawl4ai
-                    logger.info(f"切换到 Crawl4AI 爬取: {url}")
-
-            # 3. Crawl4AI 也失败时，回退到内置备用爬取方案
-            if not scrape_result.get("success") and not self._use_alternate:
-                logger.warning(f"Crawl4AI 爬取失败，回退到内置备用爬取方案: {url}")
-                scrape_result = await self._scrape_with_alternate(url, options, cookies)
-                if scrape_result.get("success"):
-                    self._use_alternate = True  # 后续继续使用备用方案
-                    logger.info(f"切换到内置备用爬取方案: {url}")
+                metadata = dict(scrape_result.get("metadata") or {})
+                metadata.setdefault("crawl_route", {
+                    "site_type": "structured_api",
+                    "strategies": ["structured_adapter"],
+                    "reason": "matched built-in structured adapter",
+                    "rule_name": "structured-adapter",
+                    "render_list_if_sparse": False,
+                    "min_article_links": 1,
+                    "selected_strategy": "structured_adapter",
+                    "attempts": [{"strategy": "structured_adapter", "status": "success"}],
+                })
+                scrape_result["metadata"] = metadata
 
             # 4. 所有爬取方式都失败
             if not scrape_result.get("success"):
@@ -2639,7 +2740,8 @@ class WebScraper:
         result: ScrapedResult,
         category_id: Optional[str] = None,
         source_id: Optional[str] = None,
-        deduplicate: bool = True
+        deduplicate: bool = True,
+        _lock_retries: int = 2,
     ) -> Tuple[bool, str]:
         """
         将爬取结果保存到数据库
@@ -2731,6 +2833,9 @@ class WebScraper:
                                 db.flush()
                             existing.keywords.append(ArticleKeyword(keyword_id=keyword.id))
 
+                    from app.services.article_signals import classify_article_provenance
+                    classify_article_provenance(db, existing)
+
                     db.commit()
                     logger.info(
                         f"更新数据库文章并保留来源: id={existing.id}, "
@@ -2789,6 +2894,9 @@ class WebScraper:
                         article.keywords.append(ArticleKeyword(keyword_id=keyword.id))
 
                 db.add(article)
+                db.flush()
+                from app.services.article_signals import classify_article_provenance
+                classify_article_provenance(db, article)
                 db.commit()
                 db.refresh(article)
 
@@ -2799,6 +2907,22 @@ class WebScraper:
                 db.close()
 
         except Exception as e:
+            if "database is locked" in str(e).lower() and _lock_retries > 0:
+                delay = 0.25 * (3 - _lock_retries)
+                logger.warning(
+                    "SQLite 写锁，%.2f 秒后重试保存（剩余 %s 次）: %s",
+                    delay,
+                    _lock_retries,
+                    result.url,
+                )
+                time.sleep(delay)
+                return self.save_to_database(
+                    result,
+                    category_id=category_id,
+                    source_id=source_id,
+                    deduplicate=deduplicate,
+                    _lock_retries=_lock_retries - 1,
+                )
             logger.error(f"保存到数据库失败: {e}")
             return False, str(e)
 
@@ -3648,68 +3772,46 @@ class WebScraper:
                 list_page.links, url, trusted_list_urls=set(list_item_dates)
             )
 
-            # 如果过滤结果少于5个，检查是否需要 Playwright 渲染（如 cas.cn）
-            if len(article_links) < 5:
-                parsed_url = urlparse(url)
-                needs_playwright_render = (
-                    parsed_url.netloc == 'www.cas.cn'
+            # 稀疏列表由站点类型决定是否浏览器渲染，不再对单一域名写死。
+            route_decision = self._route_for(url, html=list_page.html or "", cookies=options.cookies)
+            sparse_threshold = route_decision.min_article_links
+            should_render_sparse_list = (
+                len(article_links) < sparse_threshold
+                and (
+                    route_decision.render_list_if_sparse
+                    or self._detect_js_rendering_needed(list_page.html or "")
                 )
-
-                if needs_playwright_render:
-                    logger.info(f"检测到 cas.cn 网站，使用 Playwright 渲染获取文章链接")
-                    rendered_html = await self._render_list_page_for_links(url, list_page.html)
-                    if rendered_html and len(rendered_html) > len(list_page.html or ""):
-                        # 从渲染后的 HTML 提取链接和日期
-                        from bs4 import BeautifulSoup
-                        soup = BeautifulSoup(rendered_html, 'html.parser')
-                        from urllib.parse import urljoin
-
-                        playwright_links = []
-                        # 查找所有文章链接
-                        for link in soup.find_all('a', href=True):
-                            href = link.get('href', '')
-                            text = link.get_text(strip=True)
-                            if href and text and len(text) > 3:
-                                # 构建完整 URL
-                                full_url = urljoin(url, href)
-                                # 检查是否是 cas.cn 的文章链接
-                                if 'cas.cn' in full_url and (
-                                    '/syky/' in full_url or '/yw/' in full_url
-                                    or '/cg/' in full_url or '/rcjy/' in full_url
-                                ) and '.shtml' in full_url:
-                                    if full_url not in playwright_links:
-                                        playwright_links.append(full_url)
-                                    # 从链接所在区域提取日期
-                                    parent = link.find_parent(['li', 'tr', 'p'])
-                                    if parent:
-                                        date_text = parent.get_text()
-                                        date_match = re.search(r'(20\d{2})[-年]?(\d{1,2})[-月]?(\d{1,2})', date_text)
-                                        if date_match:
-                                            date_str = f"{date_match.group(1)}-{date_match.group(2).zfill(2)}-{date_match.group(3).zfill(2)}"
-                                            if date_str not in list_item_dates:
-                                                list_item_dates[full_url] = date_str
-
-                        if playwright_links:
-                            # 修正相对路径
-                            base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                            fixed_links = []
-                            for link in playwright_links:
-                                if '../' in link:
-                                    # 处理向上目录的相对路径
-                                    parts = link.replace(base_domain, '').split('/')
-                                    new_parts = []
-                                    for part in parts:
-                                        if part == '..':
-                                            if new_parts:
-                                                new_parts.pop()
-                                        elif part and part != '.':
-                                            new_parts.append(part)
-                                    fixed_url = base_domain + '/' + '/'.join(new_parts)
-                                    fixed_links.append(fixed_url)
-                                else:
-                                    fixed_links.append(link)
-                            article_links = fixed_links
-                            logger.info(f"Playwright 渲染后提取到 {len(article_links)} 个文章链接")
+            )
+            if should_render_sparse_list:
+                original_article_count = len(article_links)
+                logger.info(
+                    "稀疏列表触发浏览器渲染: url=%s type=%s links=%s threshold=%s rule=%s",
+                    url,
+                    route_decision.site_type,
+                    len(article_links),
+                    sparse_threshold,
+                    route_decision.rule_name,
+                )
+                rendered_html = await self._render_list_page_for_links(url, list_page.html)
+                if rendered_html:
+                    rendered_dates = DateExtractor.extract_list_item_dates(rendered_html, url)
+                    rendered_titles = DateExtractor.extract_list_item_titles(rendered_html, url)
+                    list_item_dates.update(rendered_dates)
+                    list_item_titles.update(rendered_titles)
+                    rendered_links = self._extract_links_from_html(rendered_html, url)
+                    rendered_articles = self._filter_article_links(
+                        rendered_links,
+                        url,
+                        trusted_list_urls=set(list_item_dates),
+                    )
+                    if len(rendered_articles) > len(article_links):
+                        article_links = rendered_articles
+                        list_page.html = rendered_html
+                    logger.info(
+                        "浏览器渲染列表结果: 原候选=%s，渲染候选=%s",
+                        original_article_count,
+                        len(rendered_articles),
+                    )
 
             # 去重
             article_links = list(dict.fromkeys(article_links))
@@ -3828,11 +3930,25 @@ class WebScraper:
                         if not r.published_at or self._date_in_range(r.published_at, start_date, end_date)
                     ]
                 else:
-                    # 普通页面：严格过滤，只保留有日期且在范围内的文章
-                    output_results = [
+                    dated_results = [
                         r for r in output_results
                         if r.published_at and self._date_in_range(r.published_at, start_date, end_date)
                     ]
+                    undated_results = [r for r in output_results if not r.published_at]
+
+                    # 日期筛选应当排除“明确超范围”的文章，而不是把“站点未提供
+                    # 可解析日期”的有效正文静默丢弃。若绝大多数候选都没有日期，
+                    # 说明这是相对时间、客户端渲染或其他站点特有格式；保留这些
+                    # 候选并记录告警，让后续站点适配不会重演本次 20 -> 1 的问题。
+                    if undated_results and len(undated_results) > len(output_results) * 0.5:
+                        logger.warning(
+                            "发布日期缺失占多数，保留未定日期的有效正文以避免误筛: "
+                            "范围内=%s，缺失=%s，总计=%s",
+                            len(dated_results), len(undated_results), len(output_results),
+                        )
+                        output_results = dated_results + undated_results
+                    else:
+                        output_results = dated_results
             logger.info(f"发布日期过滤: {before_count} -> {len(output_results)} 篇")
 
         # 5. 按日期排序（最新的在前）

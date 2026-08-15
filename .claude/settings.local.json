@@ -73,7 +73,14 @@
       "Bash(page_size=5 2>&1)",
       "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(f'总数: {d.get\\(\\\\\"total\\\\\",0\\)}'\\); [print\\(f'  - {a[\\\\\"title\\\\\"][:40]}'\\) for a in d.get\\('items',[]\\)]\")",
       "Bash(curl -s \"http://localhost:8080/api/articles?page=1&page_size=5\")",
-      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('总数:', d.get\\('total',0\\)\\); [print\\(f'  - {a[\\\\\"title\\\\\"][:50]}...'\\) for a in d.get\\('items',[]\\)]\")"
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('总数:', d.get\\('total',0\\)\\); [print\\(f'  - {a[\\\\\"title\\\\\"][:50]}...'\\) for a in d.get\\('items',[]\\)]\")",
+      "Bash(tasklist /FI \"PID eq 844\")",
+      "Bash(wmic process *)",
+      "Bash(tasklist)",
+      "Bash(powershell -Command \"Get-Process -Id 844 -ErrorAction SilentlyContinue | Select-Object Name,Path\")",
+      "Bash(\"C:/Users/weiji/AppData/Local/Programs/CC Switch/cc-switch.exe\" --help)",
+      "Bash(curl -s --noproxy '*' \"http://127.0.0.1:15721/status\")",
+      "Bash(curl -s --noproxy '*' \"http://127.0.0.1:15721/health\")"
     ]
   }
 }

@@ -310,7 +310,7 @@ function KnowledgeGraphPageContent() {
   const [highlightedNodeIds, setHighlightedNodeIds] = useState<Set<string>>(new Set());
   const [popoverEntity, setPopoverEntity] = useState<string | null>(null);
   const [exploreOpen, setExploreOpen] = useState(false);
-  const [exploreTab, setExploreTab] = useState("path");
+  const [exploreTab, setExploreTab] = useState("community");
   const [profileQuery, setProfileQuery] = useState("");
   const [entityProfile, setEntityProfile] = useState<EntityProfile | null>(null);
   const [pathSource, setPathSource] = useState("");
@@ -501,13 +501,22 @@ function KnowledgeGraphPageContent() {
     if (!entityName) return;
     setExploreLoading(true);
     try {
-      const response = await fetch(
-        `/api/kg/explore/entity-profile/${encodeURIComponent(entityName)}`
-      );
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "实体档案查询失败");
-      setEntityProfile(data);
+      const [profileResponse, similarResponse] = await Promise.all([
+        fetch(`/api/kg/explore/entity-profile/${encodeURIComponent(entityName)}`),
+        fetch(`/api/kg/mining/similar/${encodeURIComponent(entityName)}?limit=12&min_score=0&same_type=true`),
+      ]);
+      const profileData = await profileResponse.json();
+      if (!profileResponse.ok) throw new Error(profileData.detail || "实体档案查询失败");
+      setEntityProfile(profileData);
       setProfileQuery(entityName);
+      setSimilarQuery(entityName);
+      if (similarResponse.ok) {
+        const similarData = await similarResponse.json();
+        setSimilarEntities(similarData.results || []);
+        setEmbeddingVersion(similarData.version || null);
+      } else {
+        setSimilarEntities([]);
+      }
     } catch (error) {
       setEntityProfile(null);
       toast.error(error instanceof Error ? error.message : "实体档案查询失败");
@@ -604,9 +613,32 @@ function KnowledgeGraphPageContent() {
     }
   };
 
+  const loadDiscoveryOverview = async () => {
+    setExploreLoading(true);
+    try {
+      const [communityResponse, rankingResponse] = await Promise.all([
+        fetch("/api/kg/mining/communities?min_size=3&limit=30"),
+        fetch("/api/kg/explore/entity-ranking?limit=20"),
+      ]);
+      const [communityData, rankingData] = await Promise.all([
+        communityResponse.json(),
+        rankingResponse.json(),
+      ]);
+      if (!communityResponse.ok || !rankingResponse.ok) {
+        throw new Error(communityData.detail || rankingData.detail || "发现概览加载失败");
+      }
+      setCommunities(communityData.communities || []);
+      setEntityRanking(rankingData.entities || []);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "发现概览加载失败");
+    } finally {
+      setExploreLoading(false);
+    }
+  };
+
   const changeExploreTab = (value: string) => {
     setExploreTab(value);
-    if (value === "community" && communities.length === 0) loadMiningResults("community");
+    if (value === "community" && communities.length === 0 && entityRanking.length === 0) loadDiscoveryOverview();
     if (value === "cross-document" && crossDocumentCandidates.length === 0) loadMiningResults("cross-document");
     if (value === "aliases" && aliasCandidates.length === 0) loadMiningResults("aliases");
     if (value === "governance" && legacyRelations.length === 0) loadMiningResults("governance");
@@ -1624,7 +1656,13 @@ function KnowledgeGraphPageContent() {
             size="sm"
             variant={exploreOpen ? "default" : "outline"}
             className="ml-auto"
-            onClick={() => setExploreOpen((open) => !open)}
+            onClick={() => {
+              const nextOpen = !exploreOpen;
+              setExploreOpen(nextOpen);
+              if (nextOpen && exploreTab === "community" && communities.length === 0 && entityRanking.length === 0) {
+                loadDiscoveryOverview();
+              }
+            }}
           >
             <Route className="w-4 h-4 mr-2" />
             知识探索
@@ -1638,26 +1676,21 @@ function KnowledgeGraphPageContent() {
               <div className="flex items-center justify-between border-b px-4 py-3">
                 <div>
                   <div className="font-semibold">知识探索</div>
-                  <div className="text-xs text-gray-500">基于文章来源与关系证据进行探索</div>
+                  <div className="text-xs text-gray-500">从热点主题出发，逐步查看实体、关系与事件演进</div>
                 </div>
                 <Button size="icon" variant="ghost" onClick={() => setExploreOpen(false)} title="关闭">
                   <X className="w-4 h-4" />
                 </Button>
               </div>
               <Tabs value={exploreTab} onValueChange={changeExploreTab} className="max-h-[calc(100vh-12rem)]">
-                <TabsList className="mx-4 mt-3 flex flex-wrap h-auto w-[calc(100%-2rem)] gap-1 bg-gray-100 p-1">
-                  <TabsTrigger value="path" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Route className="w-4 h-4 mr-1" />路径</TabsTrigger>
-                  <TabsTrigger value="profile" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><BookOpen className="w-4 h-4 mr-1" />档案</TabsTrigger>
-                  <TabsTrigger value="community" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Users className="w-4 h-4 mr-1" />社区</TabsTrigger>
-                  <TabsTrigger value="inference" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><BrainCircuit className="w-4 h-4 mr-1" />推理</TabsTrigger>
-                  <TabsTrigger value="timeline" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Clock3 className="w-4 h-4 mr-1" />时序</TabsTrigger>
-                  <TabsTrigger value="prediction" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Link2 className="w-4 h-4 mr-1" />预测</TabsTrigger>
-                  <TabsTrigger value="similar" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Boxes className="w-4 h-4 mr-1" />相似</TabsTrigger>
-                  <TabsTrigger value="causal" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><GitBranch className="w-4 h-4 mr-1" />因果</TabsTrigger>
-                  <TabsTrigger value="cross-document" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><GitMerge className="w-4 h-4 mr-1" />共现</TabsTrigger>
-                  <TabsTrigger value="aliases" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><ScanSearch className="w-4 h-4 mr-1" />别名</TabsTrigger>
-                  <TabsTrigger value="governance" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><ShieldCheck className="w-4 h-4 mr-1" />治理</TabsTrigger>
-                  <TabsTrigger value="ranking" className="flex-none px-3 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><TrendingUp className="w-4 h-4 mr-1" />排行</TabsTrigger>
+                <div className="px-4 pt-3 text-xs leading-5 text-gray-500">
+                  建议顺序：选主题或热点实体 → 查看实体档案 → 验证关系路径 → 观察事件时序
+                </div>
+                <TabsList className="mx-4 mt-2 grid h-auto w-[calc(100%-2rem)] grid-cols-4 gap-1 bg-gray-100 p-1">
+                  <TabsTrigger value="community" className="px-2 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Users className="w-4 h-4 mr-1" />主题热点</TabsTrigger>
+                  <TabsTrigger value="profile" className="px-2 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><BookOpen className="w-4 h-4 mr-1" />实体探索</TabsTrigger>
+                  <TabsTrigger value="path" className="px-2 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Route className="w-4 h-4 mr-1" />关系路径</TabsTrigger>
+                  <TabsTrigger value="timeline" className="px-2 py-1.5 bg-transparent data-active:bg-white data-active:shadow-sm"><Clock3 className="w-4 h-4 mr-1" />事件时序</TabsTrigger>
                 </TabsList>
                 <TabsContent value="path" className="m-0 p-4">
                   <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
@@ -1734,6 +1767,21 @@ function KnowledgeGraphPageContent() {
                             ))}
                           </div>
                         </div>
+                        {similarEntities.length > 0 && (
+                          <div>
+                            <div className="mb-2 flex items-center justify-between text-sm font-medium">
+                              <span>相似实体</span>
+                              <span className="text-[10px] font-normal text-gray-400">基于图谱关系结构</span>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {similarEntities.slice(0, 8).map((entity) => (
+                                <button key={entity.name} className="border bg-gray-50 px-2 py-1 text-left text-xs hover:bg-gray-100" onClick={() => loadEntityProfile(entity.name)}>
+                                  {entity.name} · {Math.round(entity.score * 100)}%
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                         <div>
                           <div className="mb-2 text-sm font-medium">关系证据</div>
                           <div className="space-y-2">
@@ -1755,32 +1803,28 @@ function KnowledgeGraphPageContent() {
                 <TabsContent value="community" className="m-0 p-4">
                   <div className="flex items-center justify-between">
                     <div>
-                      <div className="text-sm font-medium">Louvain 实体社区</div>
-                      <div className="text-xs text-gray-500">按关系紧密程度自动分组</div>
+                      <div className="text-sm font-medium">主题与热点</div>
+                      <div className="text-xs text-gray-500">先看高频实体，再进入关系紧密的主题群组</div>
                     </div>
-                    <Button size="icon" variant="outline" onClick={() => loadMiningResults("community")} disabled={exploreLoading} title="重新计算社区">
+                    <Button size="icon" variant="outline" onClick={loadDiscoveryOverview} disabled={exploreLoading} title="刷新主题与热点">
                       <RefreshCw className={`w-4 h-4 ${exploreLoading ? "animate-spin" : ""}`} />
                     </Button>
                   </div>
-                  <div className="mt-3 grid grid-cols-[1fr_auto_1fr_auto] items-center gap-2 border-y py-2">
-                    <Input list="kg-entity-names" value={causalSource} onChange={(event) => setCausalSource(event.target.value)} placeholder="因果链起点" />
-                    <span className="text-gray-400">→</span>
-                    <Input list="kg-entity-names" value={causalTarget} onChange={(event) => setCausalTarget(event.target.value)} placeholder="终点（可选）" onKeyDown={(event) => event.key === "Enter" && loadCausalChains()} />
-                    <Button size="icon" variant="outline" onClick={loadCausalChains} disabled={exploreLoading} title="查询已审核因果链">
-                      <Route className="h-4 w-4" />
-                    </Button>
-                  </div>
-                  {causalChains.length > 0 && (
-                    <div className="border-b py-2">
-                      <div className="text-xs font-medium">已审核因果链 · {causalChains.length}</div>
-                      {causalChains.slice(0, 4).map((chain, index) => (
-                        <button key={`${chain.nodes.map((node) => node.name).join("-")}-${index}`} className="mt-1 block w-full truncate text-left text-xs text-indigo-700 hover:underline" onClick={() => { setExploreTab("path"); setPathSource(chain.nodes[0]?.name || ""); setPathTarget(chain.nodes.at(-1)?.name || ""); }}>
-                          {chain.nodes.map((node) => node.name).join(" → ")} · {Math.round(chain.confidence * 100)}%
+                  <div className="mt-3 border-y py-3">
+                    <div className="mb-2 text-xs font-medium text-gray-600">高频实体</div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {entityRanking.slice(0, 8).map((item, index) => (
+                        <button key={item.name} className="flex min-w-0 items-center gap-2 border bg-gray-50 px-2 py-1.5 text-left hover:bg-gray-100" onClick={() => { setExploreTab("profile"); loadEntityProfile(item.name); }}>
+                          <span className="w-4 shrink-0 text-right text-[10px] text-gray-400">{index + 1}</span>
+                          <span className="min-w-0 flex-1 truncate text-xs font-medium">{item.name}</span>
+                          <span className="shrink-0 text-[10px] text-indigo-600">{item.occurrence_count} 篇</span>
                         </button>
                       ))}
+                      {entityRanking.length === 0 && !exploreLoading && <div className="col-span-2 py-2 text-center text-xs text-gray-400">暂无热点实体</div>}
                     </div>
-                  )}
-                  <ScrollArea className="mt-3 h-[20rem] pr-3">
+                  </div>
+                  <ScrollArea className="mt-3 h-[18rem] pr-3">
+                    <div className="mb-2 text-xs font-medium text-gray-600">关联主题</div>
                     {communities.length === 0 && !exploreLoading ? (
                       <div className="py-12 text-center text-sm text-gray-400">尚未发现满足条件的实体社区</div>
                     ) : communities.map((community) => (

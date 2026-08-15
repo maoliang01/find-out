@@ -1,10 +1,12 @@
 from datetime import date
 
 from app.services.scraper import (
+    DateExtractor,
     LIST_METADATA_ONLY_ERROR,
     LIST_METADATA_PLACEHOLDER,
     ScrapedResult,
     WebScraper,
+    current_local_date,
     mark_result_as_metadata_only,
 )
 
@@ -76,6 +78,14 @@ def test_date_prefilter_is_strict_when_mapping_coverage_is_high():
     )
 
     assert result == links[:2]
+
+
+def test_date_extractor_accepts_explicit_relative_publish_time():
+    """Relative timestamps are explicit publish times on many dynamic news sites."""
+    today = current_local_date().isoformat()
+
+    assert DateExtractor.extract_from_html('<span class="time">0分钟前</span>') == today
+    assert DateExtractor.extract_from_html('<time>0小时前</time>') == today
 
 
 def test_article_filter_accepts_explicit_detail_paths_across_categories():

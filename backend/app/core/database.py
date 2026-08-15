@@ -168,8 +168,20 @@ def get_engine():
         _engine = create_engine(
             sqlite_url,
             echo=os.getenv("SQL_ECHO", "false").lower() == "true",
-            connect_args={"check_same_thread": False},  # SQLite 需要
+            connect_args={"check_same_thread": False, "timeout": 30},
         )
+
+        @event.listens_for(_engine, "connect")
+        def _configure_sqlite_connection(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.execute("PRAGMA foreign_keys=ON")
+            finally:
+                cursor.close()
+
         logger.info(f"✅ 使用 SQLite: {SQLITE_DB_PATH}")
     return _engine
 
@@ -217,6 +229,8 @@ def init_db():
     _ensure_wechat_account_columns(engine)
     _ensure_knowledge_job_columns(engine)
     _ensure_prediction_columns(engine)
+    _ensure_article_signal_columns(engine)
+    _ensure_insight_alert_columns(engine)
     logger.info("数据库表已创建/更新")
 
     # 创建全文搜索索引（如果不存在）
@@ -244,6 +258,61 @@ def _ensure_prediction_columns(engine) -> None:
         connection.execute(text(
             "ALTER TABLE prediction_records ADD COLUMN IF NOT EXISTS interpretation JSONB"
         ))
+
+
+def _ensure_article_signal_columns(engine) -> None:
+    """Add provenance fields to databases created before duplicate grouping existed."""
+    statements = (
+        "content_fingerprint VARCHAR(64)",
+        "duplicate_group_id VARCHAR(40)",
+        "article_role VARCHAR(20) DEFAULT 'original'",
+    )
+    if engine.url.drivername == "sqlite":
+        with engine.begin() as connection:
+            columns = {row[1] for row in connection.execute(text("PRAGMA table_info(articles)"))}
+            for definition in statements:
+                name = definition.split()[0]
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE articles ADD COLUMN {definition}"))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_articles_content_fingerprint "
+                "ON articles(content_fingerprint)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_articles_duplicate_group "
+                "ON articles(duplicate_group_id)"
+            ))
+        return
+    with engine.begin() as connection:
+        for definition in statements:
+            connection.execute(text(f"ALTER TABLE articles ADD COLUMN IF NOT EXISTS {definition}"))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_articles_content_fingerprint "
+            "ON articles(content_fingerprint)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_articles_duplicate_group "
+            "ON articles(duplicate_group_id)"
+        ))
+
+
+def _ensure_insight_alert_columns(engine) -> None:
+    """Add explainability fields to persisted alerts created before risk signals."""
+    statements = (
+        "independent_source_count INTEGER DEFAULT 0",
+        "risk_assessment JSON",
+    )
+    if engine.url.drivername == "sqlite":
+        with engine.begin() as connection:
+            columns = {row[1] for row in connection.execute(text("PRAGMA table_info(insight_alerts)"))}
+            for definition in statements:
+                name = definition.split()[0]
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE insight_alerts ADD COLUMN {definition}"))
+        return
+    with engine.begin() as connection:
+        for definition in statements:
+            connection.execute(text(f"ALTER TABLE insight_alerts ADD COLUMN IF NOT EXISTS {definition}"))
 
 
 def _ensure_wechat_account_columns(engine) -> None:

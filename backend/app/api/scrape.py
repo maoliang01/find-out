@@ -3,7 +3,7 @@
 """
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 from typing import Optional, List, Literal
 from datetime import datetime, date
 import asyncio
@@ -73,6 +73,30 @@ class ScrapeSourcesRequest(BaseModel):
     cookies: Optional[str] = None  # Cookie 字符串，用于绕过反爬
 
 
+class CrawlRouteRuleRequest(BaseModel):
+    name: str
+    domains: List[str]
+    site_type: Literal[
+        "static_html", "dynamic_js", "structured_api", "anti_bot", "aggregation", "adaptive"
+    ] = "adaptive"
+    strategies: List[Literal["http", "browser", "firecrawl"]] = Field(
+        default_factory=lambda: ["http", "browser", "firecrawl"]
+    )
+    path_patterns: List[str] = Field(default_factory=list)
+    render_list_if_sparse: bool = False
+    min_article_links: int = 5
+
+
+class CrawlRouteConfigRequest(BaseModel):
+    rules: List[CrawlRouteRuleRequest]
+
+
+class CrawlRouteClassifyRequest(BaseModel):
+    url: str
+    html: str = ""
+    has_cookies: bool = False
+
+
 class ScrapedResultResponse(BaseModel):
     """爬取结果响应"""
     url: str
@@ -87,11 +111,12 @@ class ScrapedResultResponse(BaseModel):
     published_at: Optional[str] = None
     author: Optional[str] = None
     summary: Optional[str] = None
-    keywords: List[str] = []
+    keywords: List[str] = Field(default_factory=list)
     style: Optional[str] = None  # 文体
     db_id: Optional[str] = None  # 数据库文章 ID（保存后返回）
     needs_cookie: bool = False  # 是否需要 Cookie 才能继续
     blocked_domain: Optional[str] = None  # 被反爬的域名
+    crawl_route: Optional[dict] = None  # 站点类型、命中规则、所选策略和尝试记录
 
 
 def _result_to_response(result: ScrapedResult) -> ScrapedResultResponse:
@@ -124,7 +149,42 @@ def _result_to_response(result: ScrapedResult) -> ScrapedResultResponse:
         db_id=getattr(result, "db_id", None),  # 获取数据库 ID
         needs_cookie=needs_cookie,
         blocked_domain=blocked_domain,
+        crawl_route=(result.metadata or {}).get("crawl_route") if result.metadata else None,
     )
+
+
+@router.get("/routes")
+async def get_crawl_routes():
+    """Return hot-reloadable user rules and built-in routing defaults."""
+    from app.services.site_router import get_site_strategy_router
+
+    return get_site_strategy_router().get_config()
+
+
+@router.put("/routes")
+async def replace_crawl_routes(request: CrawlRouteConfigRequest):
+    """Replace user rules atomically; the next crawl sees them without a restart."""
+    from app.services.site_router import get_site_strategy_router
+
+    try:
+        return get_site_strategy_router().replace_user_rules(
+            [rule.model_dump() for rule in request.rules]
+        )
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/routes/classify")
+async def classify_crawl_route(request: CrawlRouteClassifyRequest):
+    """Preview routing for a URL without fetching it."""
+    from app.services.site_router import get_site_strategy_router
+
+    decision = get_site_strategy_router().classify(
+        request.url,
+        html=request.html,
+        cookies="configured" if request.has_cookies else None,
+    )
+    return decision.to_dict()
 
 
 @router.post("")

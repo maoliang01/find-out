@@ -34,6 +34,7 @@ function normalizeScrapeResult(raw: Record<string, unknown>): ScrapeResult {
     // 反爬相关
     needsCookie: raw.needs_cookie as boolean | undefined,
     blockedDomain: raw.blocked_domain as string | undefined,
+    crawlRoute: raw.crawl_route as ScrapeResult["crawlRoute"],
     // 来源信息（用于文章列表显示）
     sourceId: raw.source_id as string | undefined,
     sourceName: raw.source_name as string | undefined,

@@ -128,6 +128,11 @@ class Article(Base):
 
     # 去重字段
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    # Provenance signals: copies remain searchable, but are not counted as
+    # independent evidence by event aggregation and alerting.
+    content_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    duplicate_group_id: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    article_role: Mapped[str] = mapped_column(String(20), default="original", index=True)
 
     # 关联关系
     source_id: Mapped[Optional[str]] = mapped_column(

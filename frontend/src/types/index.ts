@@ -194,6 +194,17 @@ export interface ScrapeOptions {
   timeout: number;
 }
 
+export interface CrawlRouteDiagnostic {
+  site_type: "static_html" | "dynamic_js" | "structured_api" | "anti_bot" | "aggregation" | "adaptive";
+  strategies: string[];
+  reason: string;
+  rule_name: string;
+  selected_strategy?: string | null;
+  render_list_if_sparse: boolean;
+  min_article_links: number;
+  attempts?: Array<Record<string, unknown>>;
+}
+
 /** 爬取结果 */
 export interface ScrapeResult {
   url: string;
@@ -215,6 +226,7 @@ export interface ScrapeResult {
   // 反爬相关
   needsCookie?: boolean;     // 是否需要 Cookie 才能继续
   blockedDomain?: string;    // 被反爬的域名
+  crawlRoute?: CrawlRouteDiagnostic; // 自动识别的站点类型和实际策略
   // 来源信息（用于文章列表显示）
   sourceId?: string;
   sourceName?: string;
